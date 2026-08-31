@@ -950,7 +950,9 @@ async def anketa_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             chat_id=ank["user_id"],
             text="❌ Твою анкету отклонили. Попробуй ещё раз — и в этот раз подумай, прежде чем писать."
         )
-
+async def anketa_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    
 
 async def add_anketnik(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
