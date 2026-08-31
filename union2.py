@@ -897,20 +897,34 @@ async def anketa_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
 
     user = query.from_user
-    if not is_anketnik(user.id):
+    if not (is_admin(user.id) or is_anketnik(user.id)):
         await query.edit_message_text("⛔ У вас нет прав для модерации анкет.")
         return
 
     data = query.data
     parts = data.split('_')
+    if len(parts) < 3:
+        await query.edit_message_text("❌ Некорректные данные кнопки.")
+        return
+
     action = parts[1]
     anketa_id = parts[2]
+
+    if action not in ("approve", "reject"):
+        await query.edit_message_text("❌ Неизвестное действие.")
+        return
 
     session = SessionLocal()
     try:
         anketa = session.query(AnketaRequest).filter_by(id=anketa_id).first()
         if not anketa:
             await query.edit_message_text("❌ Анкета не найдена.")
+            return
+
+        if anketa.status != "pending":
+            await query.edit_message_text(
+                f"ℹ️ Анкета уже обработана ранее (статус: {anketa.status})."
+            )
             return
 
         if action == "approve":
@@ -935,7 +949,10 @@ async def anketa_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
     except Exception as e:
         logger.error(f"Ошибка в anketa_callback: {e}")
-        await query.edit_message_text("❌ Произошла ошибка при обработке.")
+        try:
+            await query.edit_message_text("❌ Произошла ошибка при обработке.")
+        except TelegramError:
+            pass
     finally:
         session.close()
 
