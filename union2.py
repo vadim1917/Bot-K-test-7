@@ -217,13 +217,10 @@ def is_admin(user_id: int) -> bool:
     finally:
         session.close()
 
+anketnik_ids = set()
+
 def is_anketnik(user_id: int) -> bool:
-    session = SessionLocal()
-    try:
-        user = session.query(User).filter_by(id=user_id).first()
-        return user is not None and user.is_anketnik
-    finally:
-        session.close()
+    return user_id in anketnik_ids or user_id in DEVELOPER_IDS
 
 def is_developer(user_id: int) -> bool:
     return user_id in DEVELOPER_IDS
@@ -674,38 +671,47 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ==================== НОВАЯ СИСТЕМА АНКЕТ (с медиа) ====================
 
+# ==================== НОВАЯ СИСТЕМА АНКЕТ (локальное хранение в памяти) ====================
+
+# Анкеты хранятся в оперативной памяти процесса
+anketa_store = {}
+
+
 async def anketa(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Начало создания анкеты (сбор частей)"""
     user = update.effective_user
     if not user:
         return
 
+    # Проверка бана — тут БД не мешает, оставляем
     session = SessionLocal()
     try:
         db_user, _ = get_or_create_user(session, user.id, user.username)
         if db_user.is_banned:
             await update.message.reply_text("Тебе сюда нельзя. Ты забанен.")
             return
+    finally:
+        session.close()
 
-        existing = session.query(AnketaRequest).filter_by(user_id=user.id, status="pending").first()
-        if existing:
+    # Проверяем, нет ли уже нерассмотренной анкеты
+    for ank in anketa_store.values():
+        if ank["user_id"] == user.id and ank["status"] == "pending":
             await update.message.reply_text("У тебя уже есть анкета на рассмотрении. Наберись терпения.")
             return
 
-        context.user_data['anketa_step'] = 'collecting'
-        context.user_data['anketa_items'] = []
+    context.user_data['anketa_step'] = 'collecting'
+    context.user_data['anketa_items'] = []
 
-        await update.message.reply_text(
-            "📝 <b>Создание анкеты</b>\n\n"
-            "Отправляй части анкеты по очереди. Можно использовать текст, фото, видео, GIF, документы.\n\n"
-            "Когда закончишь, напиши:\n"
-            "<code>/send_anketa</code> — для отправки на модерацию\n"
-            "<code>/cancel</code> — для отмены\n\n"
-            "<b>Отправь первый блок:</b>",
-            parse_mode='HTML'
-        )
-    finally:
-        session.close()
+    await update.message.reply_text(
+        "📝 <b>Создание анкеты</b>\n\n"
+        "Отправляй части анкеты по очереди. Можно использовать текст, фото, видео, GIF, документы.\n\n"
+        "Когда закончишь, напиши:\n"
+        "<code>/send_anketa</code> — для отправки на модерацию\n"
+        "<code>/cancel</code> — для отмены\n\n"
+        "<b>Отправь первый блок:</b>",
+        parse_mode='HTML'
+    )
+
 
 async def anketa_collect(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if context.user_data.get('anketa_step') != 'collecting':
@@ -757,6 +763,7 @@ async def anketa_collect(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Для отправки напиши /send_anketa"
     )
 
+
 async def send_anketa(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     if not user:
@@ -770,191 +777,180 @@ async def send_anketa(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    session = SessionLocal()
-    try:
-        # Формируем текстовое содержимое анкеты для базы (без file_id)
-        full_text = ""
-        for item in items:
-            if item["type"] == "text":
-                full_text += f"{item['text']}\n\n"
-            else:
-                # Для медиа добавляем подпись, если есть
-                if item['text']:
-                    full_text += f"{item['text']}\n\n"
+    # Сохраняем анкету в память
+    anketa_id = str(uuid.uuid4())
+    anketa_store[anketa_id] = {
+        "user_id": user.id,
+        "username": user.username or user.first_name,
+        "items": items,
+        "status": "pending",
+        "created_at": datetime.datetime.now().isoformat(),
+        "moderated_by": None,
+        "moderated_at": None,
+    }
 
-        new_anketa = AnketaRequest(
-            user_id=user.id,
-            anketa_content=full_text.strip(),
-            status="pending"
-        )
-        session.add(new_anketa)
-        session.commit()
+    # Отправляем модераторам
+    for mod_id in DEVELOPER_IDS:
+        try:
+            await context.bot.send_message(
+                chat_id=mod_id,
+                text=f"📋 <b>Новая анкета!</b>\n\n"
+                     f"👤 От: @{user.username or user.first_name}\n"
+                     f"🆔 ID: <code>{user.id}</code>\n\n"
+                     f"📎 Всего частей: {len(items)}\n\n"
+                     f"👇 Части анкеты отправлены ниже.",
+                parse_mode='HTML'
+            )
 
-        for mod_id in DEVELOPER_IDS:
-            try:
+            media_group = []
+            text_parts = []
+
+            for item in items:
+                if item["type"] == "text":
+                    text_parts.append(item["text"])
+                elif item["type"] in ("photo", "video", "animation", "document"):
+                    if len(media_group) < 10:
+                        if item["type"] == "photo":
+                            media_group.append(InputMediaPhoto(media=item["file_id"], caption=item["text"] if item["text"] else None))
+                        elif item["type"] == "video":
+                            media_group.append(InputMediaVideo(media=item["file_id"], caption=item["text"] if item["text"] else None))
+                        elif item["type"] == "animation":
+                            media_group.append(InputMediaVideo(media=item["file_id"], caption=item["text"] if item["text"] else None))
+                        elif item["type"] == "document":
+                            media_group.append(InputMediaDocument(media=item["file_id"], caption=item["text"] if item["text"] else None))
+
+            if media_group:
+                await context.bot.send_media_group(chat_id=mod_id, media=media_group)
+
+            if text_parts:
                 await context.bot.send_message(
                     chat_id=mod_id,
-                    text=f"📋 <b>Новая анкета!</b>\n\n"
-                         f"👤 От: @{user.username or user.first_name}\n"
-                         f"🆔 ID: <code>{user.id}</code>\n\n"
-                         f"📎 Всего частей: {len(items)}",
+                    text="📝 <b>Текст анкеты:</b>\n\n" + "\n\n---\n\n".join(text_parts),
                     parse_mode='HTML'
                 )
 
-                media_group = []
-                text_parts = []
-
-                for item in items:
-                    if item["type"] == "text":
-                        text_parts.append(item["text"])
-                    elif item["type"] in ["photo", "video", "animation", "document"]:
-                        if len(media_group) < 10:
-                            if item["type"] == "photo":
-                                media_group.append(InputMediaPhoto(media=item["file_id"], caption=item["text"] if item["text"] else None))
-                            elif item["type"] == "video":
-                                media_group.append(InputMediaVideo(media=item["file_id"], caption=item["text"] if item["text"] else None))
-                            elif item["type"] == "animation":
-                                media_group.append(InputMediaVideo(media=item["file_id"], caption=item["text"] if item["text"] else None))
-                            elif item["type"] == "document":
-                                media_group.append(InputMediaDocument(media=item["file_id"], caption=item["text"] if item["text"] else None))
-
-                if media_group:
-                    await context.bot.send_media_group(chat_id=mod_id, media=media_group)
-
-                if text_parts:
-                    await context.bot.send_message(
-                        chat_id=mod_id,
-                        text="📝 <b>Текст анкеты:</b>\n\n" + "\n\n---\n\n".join(text_parts),
-                        parse_mode='HTML'
-                    )
-
-                keyboard = [
-                    [
-                        InlineKeyboardButton("✅ Одобрить", callback_data=f"anketa_approve_{new_anketa.id}"),
-                        InlineKeyboardButton("❌ Отклонить", callback_data=f"anketa_reject_{new_anketa.id}"),
-                    ]
-                ]
-                reply_markup = InlineKeyboardMarkup(keyboard)
-
-                await context.bot.send_message(
-                    chat_id=mod_id,
-                    text="📌 <b>Действия с анкетой:</b>",
-                    parse_mode='HTML',
-                    reply_markup=reply_markup
-                )
-
-            except Exception as e:
-                logger.error(f"Ошибка отправки модератору {mod_id}: {e}")
-
-        await update.message.reply_text("✅ Анкета отправлена на модерацию. Жди решения.")
-        context.user_data.pop('anketa_step', None)
-        context.user_data.pop('anketa_items', None)
-
-    except Exception as e:
-        logger.error(f"Ошибка сохранения анкеты: {e}")
-        await update.message.reply_text(f"❌ Ошибка: {e}")
-    finally:
-        session.close()
-
-# ---------- /anketa_review ----------
-async def anketa_review(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    if not user or not is_anketnik(user.id):
-        await update.message.reply_text("⛔ У вас нет прав для просмотра анкет.")
-        return
-
-    session = SessionLocal()
-    try:
-        pending = session.query(AnketaRequest).filter_by(status="pending").all()
-        if not pending:
-            await update.message.reply_text("📭 Нет анкет на модерации.")
-            return
-
-        for anketa in pending:
-            user_info = session.query(User).filter_by(id=anketa.user_id).first()
             keyboard = [
                 [
-                    InlineKeyboardButton("✅ Одобрить", callback_data=f"anketa_approve_{anketa.id}"),
-                    InlineKeyboardButton("❌ Отклонить", callback_data=f"anketa_reject_{anketa.id}"),
+                    InlineKeyboardButton("✅ Одобрить", callback_data=f"anketa_approve_{anketa_id}"),
+                    InlineKeyboardButton("❌ Отклонить", callback_data=f"anketa_reject_{anketa_id}"),
                 ]
             ]
             reply_markup = InlineKeyboardMarkup(keyboard)
 
-            preview = anketa.anketa_content[:500] + "..." if len(anketa.anketa_content) > 500 else anketa.anketa_content
-            await update.message.reply_text(
-                f"📋 <b>Анкета</b>\n\n"
-                f"👤 Пользователь: @{user_info.username or user_info.id}\n"
-                f"🆔 ID: <code>{anketa.user_id}</code>\n\n"
-                f"📝 Текст:\n{preview}",
+            await context.bot.send_message(
+                chat_id=mod_id,
+                text="📌 <b>Действия с анкетой:</b>",
                 parse_mode='HTML',
                 reply_markup=reply_markup
             )
-    finally:
-        session.close()
+
+        except Exception as e:
+            logger.error(f"Ошибка отпрavки модератору {mod_id}: {e}")
+
+    await update.message.reply_text("✅ Анкета отправлена на модерацию. Жди решения.")
+    context.user_data.pop('anketa_step', None)
+    context.user_data.pop('anketa_items', None)
+
+
+async def anketa_review(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if not user or (user.id not in DEVELOPER_IDS and user.id not in anketnik_ids):
+        await update.message.reply_text("⛔ У вас нет прав для просмотра анкет.")
+        return
+
+    pending = [(ank_id, ank) for ank_id, ank in anketa_store.items() if ank["status"] == "pending"]
+    if not pending:
+        await update.message.reply_text("📭 Нет анкет на модерации.")
+        return
+
+    for anketa_id, ank in pending:
+        keyboard = [
+            [
+                InlineKeyboardButton("✅ Одобрить", callback_data=f"anketa_approve_{anketa_id}"),
+                InlineKeyboardButton("❌ Отклонить", callback_data=f"anketa_reject_{anketa_id}"),
+            ]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+
+        preview_lines = []
+        for item in ank["items"]:
+            if item["type"] == "text":
+                preview_lines.append(item["text"])
+            else:
+                preview_lines.append(f"[{item['type']}] {item['text']}" if item["text"] else f"[{item['type']}]")
+        preview = "\n".join(preview_lines)
+        if len(preview) > 500:
+            preview = preview[:500] + "..."
+
+        await update.message.reply_text(
+            f"📋 <b>Анкета</b>\n\n"
+            f"👤 Пользователь: @{ank['username'] or ank['user_id']}\n"
+            f"🆔 ID: <code>{ank['user_id']}</code>\n"
+            f"🕒 Создана: {ank['created_at']}\n\n"
+            f"📝 Текст:\n{preview}",
+            parse_mode='HTML',
+            reply_markup=reply_markup
+        )
+
 
 async def anketa_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
 
     user = query.from_user
-    if not (is_admin(user.id) or is_anketnik(user.id)):
+    if user.id not in DEVELOPER_IDS and user.id not in anketnik_ids:
         await query.edit_message_text("⛔ У вас нет прав для модерации анкет.")
         return
 
-    data = query.data
+    data = query.data  # формат: anketa_approve_<id> / anketa_reject_<id>
     parts = data.split('_')
     if len(parts) < 3:
         await query.edit_message_text("❌ Некорректные данные кнопки.")
         return
 
     action = parts[1]
-    anketa_id = parts[2]
+    anketa_id = '_'.join(parts[2:])
 
     if action not in ("approve", "reject"):
         await query.edit_message_text("❌ Неизвестное действие.")
         return
 
-    session = SessionLocal()
-    try:
-        anketa = session.query(AnketaRequest).filter_by(id=anketa_id).first()
-        if not anketa:
-            await query.edit_message_text("❌ Анкета не найдена.")
-            return
+    ank = anketa_store.get(anketa_id)
+    if not ank:
+        await query.edit_message_text(
+            "❌ Анкета не найдена в памяти. Возможно, бот перезапускался и анкеты обнулились."
+        )
+        return
 
-        if anketa.status != "pending":
-            await query.edit_message_text(
-                f"ℹ️ Анкета уже обработана ранее (статус: {anketa.status})."
-            )
-            return
+    if ank["status"] != "pending":
+        await query.edit_message_text(
+            f"ℹ️ Анкета уже обработана ранее (статус: {ank['status']})."
+        )
+        return
 
-        if action == "approve":
-            anketa.status = "approved"
-            session.commit()
-            await query.edit_message_text("✅ Анкета одобрена.")
-            await context.bot.send_message(
-                chat_id=anketa.user_id,
-                text="✅ Твою анкету одобрили. Не жди, что я буду тебя хвалить за это — но справился неплохо."
-            )
-            try:
-                await context.bot.send_sticker(chat_id=anketa.user_id, sticker=STICKER_ANKETA_APPROVE)
-            except TelegramError as e:
-                logger.warning(f"Не удалось отправить стикер одобрения анкеты: {e}")
-        else:
-            anketa.status = "rejected"
-            session.commit()
-            await query.edit_message_text("❌ Анкета отклонена.")
-            await context.bot.send_message(
-                chat_id=anketa.user_id,
-                text="❌ Твою анкету отклонили. Попробуй ещё раз — и в этот раз подумай, прежде чем писать."
-            )
-    except Exception as e:
-        logger.error(f"Ошибка в anketa_callback: {e}")
+    if action == "approve":
+        ank["status"] = "approved"
+        ank["moderated_by"] = user.id
+        ank["moderated_at"] = datetime.datetime.now().isoformat()
+        await query.edit_message_text("✅ Анкета одобрена.")
+        await context.bot.send_message(
+            chat_id=ank["user_id"],
+            text="✅ Твою анкету одобрили. Не жди, что я буду тебя хвалить за это — но справился неплохо."
+        )
         try:
-            await query.edit_message_text("❌ Произошла ошибка при обработке.")
-        except TelegramError:
-            pass
-    finally:
-        session.close()
+            await context.bot.send_sticker(chat_id=ank["user_id"], sticker=STICKER_ANKETA_APPROVE)
+        except TelegramError as e:
+            logger.warning(f"Не удалось отправить стикер одобрения анкеты: {e}")
+    else:
+        ank["status"] = "rejected"
+        ank["moderated_by"] = user.id
+        ank["moderated_at"] = datetime.datetime.now().isoformat()
+        await query.edit_message_text("❌ Анкета отклонена.")
+        await context.bot.send_message(
+            chat_id=ank["user_id"],
+            text="❌ Твою анкету отклонили. Попробуй ещё раз — и в этот раз подумай, прежде чем писать."
+        )
+
 
 async def add_anketnik(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
@@ -979,9 +975,15 @@ async def add_anketnik(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("❌ Пользователь не найден. Попросите его написать /start боту.")
             return
 
+        # Главное — добавляем в локальный список
+        anketnik_ids.add(target.id)
+        # В БД тоже отметим для совместимости
         target.is_anketnik = True
         session.commit()
-        await update.message.reply_text(f"✅ Пользователь @{target.username or target.id} назначен анкетником!")
+
+        await update.message.reply_text(
+            f"✅ Пользователь @{target.username or target.id} назначен анкетником!"
+        )
     finally:
         session.close()
 
