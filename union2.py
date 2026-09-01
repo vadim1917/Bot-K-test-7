@@ -108,6 +108,10 @@ class User(Base):
     is_anketnik = Column(Boolean, default=False)
     is_banned = Column(Boolean, default=False)
 
+    # Память о участнике для нейросетки
+    facts = Column(StringList, default=[])
+    last_seen = Column(DateTime, nullable=True)
+
     roles = relationship("Role", back_populates="user", cascade="all, delete-orphan")
     support_requests = relationship("SupportRequest", back_populates="user", cascade="all, delete-orphan")
     posts = relationship("Post", back_populates="user", cascade="all, delete-orphan")
@@ -192,7 +196,8 @@ def get_or_create_user(session, user_id, username=None):
         user = User(
             id=user_id,
             username=username or str(user_id),
-            unique_code=str(uuid.uuid4())[:8]
+            unique_code=str(uuid.uuid4())[:8],
+            last_seen=datetime.datetime.now(),
         )
         session.add(user)
         session.commit()
@@ -205,7 +210,105 @@ def get_or_create_user(session, user_id, username=None):
         session.commit()
         created = True
         logger.info(f"Создан новый пользователь: {user_id} ({username})")
+    else:
+        # Обновляем username, если изменился, и отмечаем активность
+        if username and user.username != username:
+            user.username = username
+        user.last_seen = datetime.datetime.now()
+        session.commit()
     return user, created
+
+
+def touch_user(user_id: int):
+    """Отмечает пользователя как активного (для очистки неактивных)."""
+    session = SessionLocal()
+    try:
+        user = session.query(User).filter_by(id=user_id).first()
+        if user:
+            user.last_seen = datetime.datetime.now()
+            session.commit()
+    finally:
+        session.close()
+
+
+# ==================== ПАМЯТЬ О УЧАСТНИКЕ (для нейросетки) ====================
+MAX_FACTS_PER_USER = 12
+
+def add_user_fact(user_id: int, fact: str):
+    """Добавляет факт об участнике (с дедупликацией и ограничением по количеству)."""
+    fact = (fact or "").strip()
+    if not fact or len(fact) > 300:
+        return
+    session = SessionLocal()
+    try:
+        user = session.query(User).filter_by(id=user_id).first()
+        if not user:
+            return
+        facts = list(user.facts or [])
+        if any(f.strip().lower() == fact.lower() for f in facts):
+            return
+        facts.append(fact)
+        if len(facts) > MAX_FACTS_PER_USER:
+            facts = facts[-MAX_FACTS_PER_USER:]
+        user.facts = facts
+        session.commit()
+        logger.info(f"Сохранён факт о пользователе {user_id}: {fact}")
+    finally:
+        session.close()
+
+
+def clear_user_facts(user_id: int):
+    session = SessionLocal()
+    try:
+        user = session.query(User).filter_by(id=user_id).first()
+        if user:
+            user.facts = []
+            session.commit()
+    finally:
+        session.close()
+
+
+def get_user_memory_text(user_id: int) -> str:
+    """Собирает краткую справку об участнике для передачи нейросетке."""
+    session = SessionLocal()
+    try:
+        user = session.query(User).filter_by(id=user_id).first()
+        if not user:
+            return ""
+        parts = []
+        if user.username:
+            parts.append(f"Ник в Telegram: @{user.username}")
+        if user.facts:
+            facts_str = "\n".join(f"- {f}" for f in user.facts)
+            parts.append(f"Известные факты об этом участнике:\n{facts_str}")
+        return "\n".join(parts)
+    finally:
+        session.close()
+
+
+# ---------- Простое автоматическое извлечение фактов из текста ----------
+FACT_PATTERNS = [
+    (re.compile(r"меня зовут\s+([А-ЯЁ][а-яё]{1,20})", re.IGNORECASE), lambda m: f"Зовут {m.group(1).capitalize()}"),
+    (re.compile(r"мо[её] имя\s*[-—:]?\s*([А-ЯЁ][а-яё]{1,20})", re.IGNORECASE), lambda m: f"Зовут {m.group(1).capitalize()}"),
+    (re.compile(r"мне\s+(\d{1,2})\s*лет", re.IGNORECASE), lambda m: f"Возраст: {m.group(1)}"),
+    (re.compile(r"я\s+живу\s+в\s+([А-ЯЁа-яё\- ]{2,30})", re.IGNORECASE), lambda m: f"Живёт в {m.group(1).strip().rstrip('.,!?')}"),
+    (re.compile(r"я\s+люблю\s+([^.!?\n]{2,60})", re.IGNORECASE), lambda m: f"Любит: {m.group(1).strip()}"),
+    (re.compile(r"я\s+увлекаюсь\s+([^.!?\n]{2,60})", re.IGNORECASE), lambda m: f"Увлекается: {m.group(1).strip()}"),
+    (re.compile(r"я\s+работаю\s+([^.!?\n]{2,60})", re.IGNORECASE), lambda m: f"Работа: {m.group(1).strip()}"),
+]
+
+def extract_facts_from_text(text: str) -> list:
+    if not text:
+        return []
+    found = []
+    for pattern, builder in FACT_PATTERNS:
+        match = pattern.search(text)
+        if match:
+            try:
+                found.append(builder(match))
+            except Exception:
+                continue
+    return found
 
 def is_admin(user_id: int) -> bool:
     if user_id in DEVELOPER_IDS:
@@ -348,8 +451,22 @@ SYSTEM_PROMPT = """Ты  бот поддержки рп чата омнивер�
 user_histories = {}
 user_active_provider = {}
 
+def build_system_prompt(user_id: int, first_name: Optional[str] = None) -> str:
+    """Достраивает системный промпт персональной информацией об участнике."""
+    memory_text = get_user_memory_text(user_id)
+    if not memory_text and not first_name:
+        return SYSTEM_PROMPT
+    extra = "\n\n**Информация об участнике, с которым ты сейчас говоришь:**\n"
+    if first_name:
+        extra += f"- Имя в Telegram: {first_name}\n"
+    if memory_text:
+        extra += memory_text + "\n"
+    extra += ("Используй эту информацию только тогда, когда это уместно по смыслу разговора — "
+              "не перечисляй её монологом и не показывай виду, что «зачитываешь досье».")
+    return SYSTEM_PROMPT + extra
+
 # ---------- Функции запросов к AI ----------
-async def ask_gemini(messages: list, model: str) -> str:
+async def ask_gemini(messages: list, model: str, system_prompt: str = SYSTEM_PROMPT) -> str:
     if not GEMINI_API_KEY:
         raise Exception("GEMINI_API_KEY not set")
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={GEMINI_API_KEY}"
@@ -361,7 +478,7 @@ async def ask_gemini(messages: list, model: str) -> str:
         contents.append({"role": gemini_role, "parts": [{"text": text}]})
     payload = {
         "contents": contents,
-        "system_instruction": {"parts": [{"text": SYSTEM_PROMPT}]},
+        "system_instruction": {"parts": [{"text": system_prompt}]},
         "generationConfig": {"temperature": 0.7, "maxOutputTokens": 1024}  # ← увеличил до 1024
     }
     async with aiohttp.ClientSession() as session:
@@ -387,13 +504,13 @@ async def ask_gemini(messages: list, model: str) -> str:
                 raise Exception("Gemini returned empty answer")
             return full_answer
 
-async def ask_gemini_with_fallback(messages: list) -> str:
+async def ask_gemini_with_fallback(messages: list, system_prompt: str = SYSTEM_PROMPT) -> str:
     if not GEMINI_API_KEY:
         raise Exception("GEMINI_API_KEY not set")
     last_error = None
     for model in GEMINI_MODELS:
         try:
-            return await asyncio.wait_for(ask_gemini(messages, model), timeout=GEMINI_MODEL_TIMEOUT)
+            return await asyncio.wait_for(ask_gemini(messages, model, system_prompt), timeout=GEMINI_MODEL_TIMEOUT)
         except asyncio.TimeoutError:
             logger.warning(f"Gemini[{model}] timed out")
             last_error = Exception(f"Gemini[{model}] timeout")
@@ -402,14 +519,14 @@ async def ask_gemini_with_fallback(messages: list) -> str:
             last_error = e
     raise last_error or Exception("Gemini: all models failed")
 
-async def ask_openrouter(messages: list) -> str:
+async def ask_openrouter(messages: list, system_prompt: str = SYSTEM_PROMPT) -> str:
     if not AI_API_KEY:
         raise Exception("AI_API_KEY not set")
     headers = {
         "Authorization": f"Bearer {AI_API_KEY}",
         "Content-Type": "application/json"
     }
-    system_msg = {"role": "system", "content": SYSTEM_PROMPT}
+    system_msg = {"role": "system", "content": system_prompt}
     payload = {
         "model": "openrouter/free",
         "messages": [system_msg] + messages,
@@ -440,14 +557,14 @@ async def ask_openrouter(messages: list) -> str:
                 raise Exception("OpenRouter safety block")
             return full_answer
 
-async def ask_groq(messages: list, model: str) -> str:
+async def ask_groq(messages: list, model: str, system_prompt: str = SYSTEM_PROMPT) -> str:
     if not GROQ_API_KEY:
         raise Exception("GROQ_API_KEY not set")
     headers = {
         "Authorization": f"Bearer {GROQ_API_KEY}",
         "Content-Type": "application/json"
     }
-    system_msg = {"role": "system", "content": SYSTEM_PROMPT}
+    system_msg = {"role": "system", "content": system_prompt}
     payload = {
         "model": model,
         "messages": [system_msg] + messages,
@@ -474,13 +591,13 @@ async def ask_groq(messages: list, model: str) -> str:
                 raise Exception("Groq empty answer")
             return full_answer
 
-async def ask_groq_with_fallback(messages: list) -> str:
+async def ask_groq_with_fallback(messages: list, system_prompt: str = SYSTEM_PROMPT) -> str:
     if not GROQ_API_KEY:
         raise Exception("GROQ_API_KEY not set")
     last_error = None
     for model in GROQ_MODELS:
         try:
-            return await asyncio.wait_for(ask_groq(messages, model), timeout=GROQ_MODEL_TIMEOUT)
+            return await asyncio.wait_for(ask_groq(messages, model, system_prompt), timeout=GROQ_MODEL_TIMEOUT)
         except asyncio.TimeoutError:
             logger.warning(f"Groq[{model}] timed out")
             last_error = Exception(f"Groq[{model}] timeout")
@@ -489,13 +606,15 @@ async def ask_groq_with_fallback(messages: list) -> str:
             last_error = e
     raise last_error or Exception("Groq: all models failed")
 
-async def ask_ai(prompt: str, user_id: int) -> str:
+async def ask_ai(prompt: str, user_id: int, first_name: Optional[str] = None) -> str:
     if user_id not in user_histories:
         user_histories[user_id] = deque(maxlen=MAX_HISTORY_LEN)
         user_active_provider.pop(user_id, None)
     history = user_histories[user_id]
     history.append({"role": "user", "content": prompt})
     messages_for_api = list(history)
+
+    system_prompt = build_system_prompt(user_id, first_name)
 
     available = []
     if GEMINI_API_KEY:
@@ -516,7 +635,7 @@ async def ask_ai(prompt: str, user_id: int) -> str:
 
     for name, func, timeout in ordered:
         try:
-            answer = await asyncio.wait_for(func(messages_for_api), timeout=timeout)
+            answer = await asyncio.wait_for(func(messages_for_api, system_prompt), timeout=timeout)
             history.append({"role": "assistant", "content": answer})
             user_active_provider[user_id] = name
             return answer
@@ -588,6 +707,8 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 /anketa — подать анкету персонажа
 /exit_ai — отключить меня от диалога
 /reset_ai — стереть историю нашего разговора
+/remember — попросить меня запомнить факт о тебе
+/forget_me — стереть всё, что я о тебе запомнила
 
 <b>Анкеты:</b>
 /send_anketa — отправить собранную анкету на модерацию (после /anketa)
@@ -622,6 +743,8 @@ Username: @{user.username or 'не указан'}
 Статус: {db_user.status_rp}
 
 Анкета: {'заполнена' if db_user.anketa_requests else 'не заполнена — самое время этим заняться'}
+
+Что я о тебе помню: {', '.join(db_user.facts) if db_user.facts else 'пока ничего особенного'}
 """
         await update.message.reply_text(profile_text, parse_mode='HTML')
     finally:
@@ -950,9 +1073,7 @@ async def anketa_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             chat_id=ank["user_id"],
             text="❌ Твою анкету отклонили. Попробуй ещё раз — и в этот раз подумай, прежде чем писать."
         )
-async def anketa_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    
+
 
 async def add_anketnik(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
@@ -1013,6 +1134,28 @@ async def deletemessages(update: Update, context: ContextTypes.DEFAULT_TYPE):
     count = int(context.args[1]) if len(context.args) > 1 else 5
     await update.message.reply_text(f"🗑️ Удалено {count} последних сообщений пользователя {target_username}.")
 
+async def remember(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if not user:
+        return
+    if not context.args:
+        await update.message.reply_text(
+            "⚠️ Использование: <code>/remember факт о себе</code>\n"
+            "Например: <code>/remember люблю классическую музыку</code>",
+            parse_mode='HTML'
+        )
+        return
+    fact = " ".join(context.args)
+    add_user_fact(user.id, fact)
+    await update.message.reply_text("Записала. Учту это на будущее.")
+
+async def forget_me(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if not user:
+        return
+    clear_user_facts(user.id)
+    await update.message.reply_text("Всё, что я о тебе запомнила, удалено.")
+
 async def exit_ai(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data['ai_mode'] = False
     await update.message.reply_text("Хорошо, отключаюсь. Вернуть меня — /start.")
@@ -1049,8 +1192,12 @@ async def handle_all_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not text:
         return
 
+    # Автоматически выцепляем базовые факты о участнике из сообщения
+    for fact in extract_facts_from_text(text):
+        add_user_fact(user.id, fact)
+
     await context.bot.send_chat_action(chat_id=update.effective_chat.id, action='typing')
-    answer = await ask_ai(text, user.id)
+    answer = await ask_ai(text, user.id, user.first_name)
     logger.info(f"Полный AI ответ: {answer}")  # ← логируем полностью
     clean_answer, emotion_key = parse_emotion_tag(answer)
     await send_with_abzats(update.message, clean_answer)
@@ -1063,6 +1210,49 @@ async def media_collector(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def unknown(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Такой команды не существует. Загляни в /help, если совсем потерялся.")
+
+# ==================== ОЧИСТКА НЕАКТИВНЫХ ПОЛЬЗОВАТЕЛЕЙ ====================
+INACTIVE_DAYS_THRESHOLD = 60          # ~2 месяца
+CLEANUP_INTERVAL_SECONDS = 24 * 60 * 60  # проверяем раз в сутки
+
+def cleanup_inactive_users():
+    session = SessionLocal()
+    try:
+        threshold_date = datetime.datetime.now() - datetime.timedelta(days=INACTIVE_DAYS_THRESHOLD)
+        inactive_users = (
+            session.query(User)
+            .filter(
+                User.last_seen.isnot(None),
+                User.last_seen < threshold_date,
+                User.is_developer == False,
+                User.is_moderator == False,
+                User.is_anketnik == False,
+            )
+            .all()
+        )
+        count = len(inactive_users)
+        for u in inactive_users:
+            user_histories.pop(u.id, None)
+            user_active_provider.pop(u.id, None)
+            session.delete(u)  # каскадно удалит роли, посты, анкеты и т.д.
+        session.commit()
+        if count:
+            logger.info(f"Очистка неактивных: удалено {count} пользователей (неактивны > {INACTIVE_DAYS_THRESHOLD} дней).")
+        else:
+            logger.info("Очистка неактивных: удалять некого.")
+    except Exception as e:
+        logger.error(f"Ошибка при очистке неактивных пользователей: {e}")
+        session.rollback()
+    finally:
+        session.close()
+
+async def cleanup_inactive_users_loop():
+    while True:
+        await asyncio.sleep(CLEANUP_INTERVAL_SECONDS)
+        try:
+            cleanup_inactive_users()
+        except Exception as e:
+            logger.error(f"Сбой цикла очистки неактивных: {e}")
 
 # ==================== FLASK ДЛЯ HEALTHCHECK (Render) ====================
 from flask import Flask
@@ -1087,12 +1277,19 @@ async def set_commands(application: Application):
         BotCommand("anketa_review", "Просмотр анкет на модерацию (для анкетников)"),
         BotCommand("exit_ai", "Выйти из режима общения с ИИ"),
         BotCommand("reset_ai", "Сбросить историю диалога с ИИ"),
+        BotCommand("remember", "Попросить бота запомнить факт о тебе"),
+        BotCommand("forget_me", "Стереть все сохранённые о тебе факты"),
         BotCommand("rules", "Показать правила сообщества"),
         BotCommand("lore", "История Омниреальности"),
         BotCommand("feedback", "Отправить отзыв или жалобу"),
     ]
     await application.bot.set_my_commands(commands)
     logger.info("Команды бота установлены через set_my_commands")
+
+async def post_init(application: Application):
+    await set_commands(application)
+    asyncio.create_task(cleanup_inactive_users_loop())
+    logger.info(f"Запущена фоновая очистка неактивных пользователей (порог: {INACTIVE_DAYS_THRESHOLD} дней).")
 
 def main():
     create_tables()
@@ -1115,6 +1312,8 @@ def main():
     application.add_handler(CommandHandler("addanketnik", add_anketnik))
     application.add_handler(CommandHandler("exit_ai", exit_ai))
     application.add_handler(CommandHandler("reset_ai", reset_ai))
+    application.add_handler(CommandHandler("remember", remember))
+    application.add_handler(CommandHandler("forget_me", forget_me))
 
     application.add_handler(CallbackQueryHandler(anketa_callback, pattern="^anketa_"))
 
@@ -1128,7 +1327,7 @@ def main():
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_all_text))
     application.add_handler(MessageHandler(filters.COMMAND, unknown))
 
-    application.post_init = set_commands
+    application.post_init = post_init
 
     logger.info("Бот Омниверс с Амадеусом запущен (лимит токенов = 1024, убрано ограничение на длину ответов).")
     application.run_polling()
