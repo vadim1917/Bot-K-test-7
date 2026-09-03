@@ -37,6 +37,14 @@ DEVELOPER_IDS = [int(x) for x in os.getenv('DEVELOPER_IDS', '5150559970').split(
 
 ANKET_CHANNEL_ID = int(os.getenv('ANKET_CHANNEL_ID', '-1003394079022'))
 
+# Резервный канал, куда дублируются анкеты, ушедшие на ручную модерацию.
+# Нужен, чтобы анкеты не пропадали безвозвратно, если бот перезапустится, пока они висят на проверке.
+# Если не задан (0) — дублирование просто не выполняется.
+BACKUP_ANKET_CHANNEL_ID = int(os.getenv('BACKUP_ANKET_CHANNEL_ID', '0'))
+
+# Сколько минут должно пройти между двумя отправками анкеты одним и тем же человеком (защита от спама).
+ANKETA_COOLDOWN_MINUTES = 30
+
 ALLOWED_CHAT_IDS = [
     int(x) for x in os.getenv('ALLOWED_CHAT_IDS', '-1003431402721,-1003355542910,-1003300824366,-1003394079022,-1003062290367').split(',')
 ]
@@ -113,6 +121,9 @@ class User(Base):
     facts = Column(StringList, default=[])
     last_seen = Column(DateTime, nullable=True)
 
+    # Когда пользователь последний раз ОТПРАВЛЯЛ анкету на модерацию (антиспам-кулдаун).
+    last_anketa_at = Column(DateTime, nullable=True)
+
     roles = relationship("Role", back_populates="user", cascade="all, delete-orphan")
     support_requests = relationship("SupportRequest", back_populates="user", cascade="all, delete-orphan")
     posts = relationship("Post", back_populates="user", cascade="all, delete-orphan")
@@ -173,6 +184,10 @@ class AnketaRequest(Base):
     created_at = Column(DateTime, default=datetime.datetime.now)
     admin_message_id = Column(BigInteger, nullable=True)
     admin_chat_id = Column(BigInteger, nullable=True)
+    # Полное содержимое анкеты (список частей: текст/фото/видео/документы) в виде JSON.
+    # Нужно, чтобы анкеты на ручной модерации переживали перезапуск бота — не только текст, но и кнопки/медиа.
+    items_json = Column(Text, nullable=True)
+    username = Column(String, nullable=True)
 
     user = relationship("User", back_populates="anketa_requests")
 
@@ -230,6 +245,142 @@ def touch_user(user_id: int):
             session.commit()
     finally:
         session.close()
+
+
+# ==================== АНТИСПАМ: КУЛДАУН НА ОТПРАВКУ АНКЕТЫ ====================
+def get_anketa_cooldown_remaining(user_id: int) -> Optional[datetime.timedelta]:
+    """
+    Возвращает оставшееся время кулдауна, если пользователь отправлял анкету
+    менее ANKETA_COOLDOWN_MINUTES минут назад, иначе None (можно отправлять).
+    Хранится в БД (а не в памяти процесса), чтобы кулдаун переживал перезапуск бота.
+    """
+    session = SessionLocal()
+    try:
+        user = session.query(User).filter_by(id=user_id).first()
+        if not user or not user.last_anketa_at:
+            return None
+        elapsed = datetime.datetime.now() - user.last_anketa_at
+        remaining = datetime.timedelta(minutes=ANKETA_COOLDOWN_MINUTES) - elapsed
+        if remaining.total_seconds() > 0:
+            return remaining
+        return None
+    finally:
+        session.close()
+
+
+def mark_anketa_submitted(user_id: int):
+    """Фиксирует момент отправки анкеты — от него отсчитывается кулдаун."""
+    session = SessionLocal()
+    try:
+        user, _ = get_or_create_user(session, user_id)
+        user.last_anketa_at = datetime.datetime.now()
+        session.commit()
+    finally:
+        session.close()
+
+
+# ==================== РОЛИ УЧАСТНИКОВ ====================
+def set_user_role(user_id: int, role_name: str, hashtag: Optional[str] = None, username: Optional[str] = None) -> str:
+    """
+    Назначает участнику ровно одну роль: удаляет все существующие роли пользователя
+    (включая дефолтную "Участник") и создаёт новую. Возвращает итоговое имя роли.
+    """
+    role_name = (role_name or "").strip()
+    if not role_name:
+        role_name = "Участник"
+    if len(role_name) > 64:
+        role_name = role_name[:64].strip()
+
+    if not hashtag:
+        hashtag = re.sub(r'[^0-9a-zA-Zа-яА-ЯёЁ_]+', '_', role_name).strip('_').lower() or "роль"
+
+    session = SessionLocal()
+    try:
+        user, _ = get_or_create_user(session, user_id, username)
+        session.query(Role).filter_by(user_id=user.id).delete()
+        new_role = Role(user_id=user.id, name=role_name, hashtag=hashtag)
+        session.add(new_role)
+        session.commit()
+        return role_name
+    finally:
+        session.close()
+
+
+# ==================== ПЕРСИСТЕНТНОСТЬ АНКЕТ НА РУЧНОЙ МОДЕРАЦИИ ====================
+def save_pending_anketa_to_db(anketa_id: str, user_id: int, username: Optional[str], items: list):
+    """
+    Сохраняет анкету, ушедшую на ручную модерацию, в БД — чтобы она не потерялась,
+    если бот перезапустится, пока анкета висит на проверке.
+    """
+    session = SessionLocal()
+    try:
+        existing = session.query(AnketaRequest).filter_by(id=anketa_id).first()
+        if existing:
+            existing.items_json = json.dumps(items, ensure_ascii=False)
+            existing.username = username
+            existing.status = "pending"
+        else:
+            record = AnketaRequest(
+                id=anketa_id,
+                user_id=user_id,
+                username=username,
+                items_json=json.dumps(items, ensure_ascii=False),
+                status="pending",
+            )
+            session.add(record)
+        session.commit()
+    except Exception as e:
+        logger.error(f"Не удалось сохранить анкету {anketa_id} в БД: {e}")
+        session.rollback()
+    finally:
+        session.close()
+
+
+def delete_anketa_from_db(anketa_id: str):
+    """Убирает анкету из БД после того, как по ней принято решение (или она обработана автоматически)."""
+    session = SessionLocal()
+    try:
+        session.query(AnketaRequest).filter_by(id=anketa_id).delete()
+        session.commit()
+    except Exception as e:
+        logger.error(f"Не удалось удалить анкету {anketa_id} из БД: {e}")
+        session.rollback()
+    finally:
+        session.close()
+
+
+def load_pending_anketas_from_db() -> dict:
+    """
+    При старте бота подтягивает из БД все анкеты, которые остались висеть на ручной
+    модерации после предыдущего запуска (например, из-за перезапуска/падения бота),
+    и возвращает их в формате, совместимом с anketa_store.
+    """
+    restored = {}
+    session = SessionLocal()
+    try:
+        rows = session.query(AnketaRequest).filter_by(status="pending").all()
+        for row in rows:
+            try:
+                items = json.loads(row.items_json) if row.items_json else []
+            except Exception as e:
+                logger.error(f"Не удалось разобрать items_json анкеты {row.id}: {e}")
+                items = []
+            restored[row.id] = {
+                "user_id": row.user_id,
+                "username": row.username,
+                "items": items,
+                "status": "pending",
+                "created_at": row.created_at.isoformat() if row.created_at else datetime.datetime.now().isoformat(),
+                "moderated_by": None,
+                "moderated_at": None,
+            }
+        if restored:
+            logger.info(f"Восстановлено {len(restored)} анкет(ы) из БД после перезапуска.")
+    except Exception as e:
+        logger.error(f"Не удалось загрузить анкеты на модерации из БД: {e}")
+    finally:
+        session.close()
+    return restored
 
 
 # ==================== ПАМЯТЬ О УЧАСТНИКЕ (для нейросетки) ====================
@@ -789,6 +940,82 @@ async def ask_anketolog(anketa_text: str, has_static_image: bool) -> str:
     raise last_error or Exception("Анкетолог: все AI-провайдеры недоступны")
 
 
+# ---------- Извлечение роли (имени персонажа) нейронкой из принятой анкеты ----------
+ROLE_EXTRACTOR_SYSTEM_PROMPT = """Ты извлекаешь имя персонажа из принятой анкеты для системы ролей Telegram-бота.
+
+Ответь СТРОГО именем персонажа — коротко, 1-4 слова, без пояснений, без кавычек, без markdown,
+без эмодзи и без дополнительного текста. Если у персонажа есть фамилия или прозвище, указанное
+как основное имя в анкете — используй его. Если по тексту анкеты невозможно однозначно понять
+имя персонажа — ответь ровно: Неизвестно"""
+
+
+async def ask_role_extractor(anketa_text: str) -> Optional[str]:
+    """
+    Просит нейросеть определить имя персонажа по тексту принятой анкеты — используется
+    для автоматического назначения роли участнику в фоне после одобрения анкеты.
+    Возвращает имя роли, либо None, если ни один провайдер недоступен или имя не определено.
+    """
+    trimmed_text = (anketa_text or "").strip()
+    if not trimmed_text:
+        return None
+
+    user_message = (
+        "Определи имя персонажа по тексту анкеты ниже.\n\n"
+        "[Текст анкеты]\n"
+        f"{trimmed_text[:3000]}"
+    )
+    messages = [{"role": "user", "content": user_message}]
+
+    available = []
+    if GEMINI_API_KEY:
+        available.append(("Gemini", ask_gemini_with_fallback, GEMINI_TOTAL_TIMEOUT))
+    if AI_API_KEY:
+        available.append(("OpenRouter", ask_openrouter, TIMEOUT_SECONDS))
+    if GROQ_API_KEY:
+        available.append(("Groq", ask_groq_with_fallback, GROQ_TOTAL_TIMEOUT))
+
+    if not available:
+        return None
+
+    for name, func, timeout in available:
+        try:
+            answer = await asyncio.wait_for(func(messages, ROLE_EXTRACTOR_SYSTEM_PROMPT), timeout=timeout)
+            clean = (answer or "").strip().strip('"').strip("'")
+            if clean and clean.lower() not in ("неизвестно", "unknown"):
+                return clean[:64]
+            return None
+        except asyncio.TimeoutError:
+            logger.warning(f"[Извлечение роли] {name} не ответил вовремя")
+        except Exception as e:
+            logger.warning(f"[Извлечение роли] {name} упал: {e}")
+
+    return None
+
+
+async def assign_role_after_approval(context: ContextTypes.DEFAULT_TYPE, user_id: int, username: Optional[str], anketa_text: str):
+    """
+    Фоновая задача: после одобрения анкеты пытается автоматически определить имя персонажа
+    нейронкой и назначить его как единственную роль участника. Не блокирует основной поток
+    одобрения анкеты (запускается через asyncio.create_task) и не поднимает исключений наружу.
+    """
+    try:
+        role_name = await ask_role_extractor(anketa_text)
+        if not role_name:
+            return
+        set_user_role(user_id, role_name, username=username)
+        try:
+            await context.bot.send_message(
+                chat_id=user_id,
+                text=f"🏷 Тебе автоматически назначена роль: <b>{role_name}</b>\n"
+                     f"Если это неверно — поправь командой /setrole.",
+                parse_mode='HTML'
+            )
+        except TelegramError as e:
+            logger.warning(f"Не удалось уведомить пользователя {user_id} о назначенной роли: {e}")
+    except Exception as e:
+        logger.error(f"Фоновое назначение роли для {user_id} не удалось: {e}")
+
+
 # ---------- Живой комментарий нейронки к решению по анкете (одобрение/отказ) ----------
 async def ask_anketa_decision_comment(action: str, anketa_text: str) -> str:
     """
@@ -932,6 +1159,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 /lore — история Омниреальности
 /profile — твой профиль
 /feedback — отправить отзыв или жалобу
+/setrole — указать свою роль (имя персонажа) вручную
 
 <b>Анкеты:</b>
 /anketa — подать анкету персонажа (по частям)
@@ -981,6 +1209,40 @@ Username: @{user.username or 'не указан'}
         await update.message.reply_text(profile_text, parse_mode='HTML')
     finally:
         session.close()
+
+# ---------- /setrole ----------
+async def setrole(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Позволяет участнику самостоятельно указать роль (имя персонажа). Роль всегда одна — новая заменяет старую."""
+    user = update.effective_user
+    if not user:
+        return
+
+    session = SessionLocal()
+    try:
+        db_user, _ = get_or_create_user(session, user.id, user.username)
+        if db_user.is_banned:
+            await update.message.reply_text("Тебе сюда нельзя. Ты забанен.")
+            return
+    finally:
+        session.close()
+
+    if not context.args:
+        await update.message.reply_text(
+            "⚠️ Использование: /setrole Имя персонажа\n"
+            "Учти: роль у тебя всегда одна — новая заменит текущую."
+        )
+        return
+
+    role_name = " ".join(context.args).strip()
+    if not role_name:
+        await update.message.reply_text("⚠️ Имя роли не может быть пустым.")
+        return
+    if len(role_name) > 64:
+        await update.message.reply_text("⚠️ Слишком длинное имя роли (максимум 64 символа).")
+        return
+
+    final_name = set_user_role(user.id, role_name, username=user.username)
+    await update.message.reply_text(f"✅ Роль обновлена: <b>{final_name}</b>", parse_mode='HTML')
 
 # ---------- /rules ----------
 @notify_on_repeat("rules")
@@ -1162,6 +1424,36 @@ async def forward_anketa_to_channel(context: ContextTypes.DEFAULT_TYPE, items: l
         )
 
 
+async def send_anketa_backup_copy(context: ContextTypes.DEFAULT_TYPE, anketa_id: str, user, items: list):
+    """
+    Дублирует анкету, ушедшую на ручную модерацию, в резервный канал (BACKUP_ANKET_CHANNEL_ID).
+    Это подстраховка на случай, если бот перезапустится, пока анкета висит на ручной проверке:
+    даже если что-то пойдёт не так с восстановлением из БД, содержимое анкеты не пропадёт бесследно.
+    Ошибки здесь не должны ломать основной процесс отправки анкеты — только логируются.
+    """
+    if not BACKUP_ANKET_CHANNEL_ID:
+        return
+    try:
+        header = (
+            f"🗄 <b>Резервная копия анкеты на модерации</b>\n"
+            f"🆔 anketa_id: <code>{anketa_id}</code>\n"
+            f"👤 От: @{user.username or user.first_name} (<code>{user.id}</code>)"
+        )
+        await context.bot.send_message(chat_id=BACKUP_ANKET_CHANNEL_ID, text=header, parse_mode='HTML')
+
+        media_group, text_parts = _build_anketa_media_group(items)
+        if media_group:
+            await context.bot.send_media_group(chat_id=BACKUP_ANKET_CHANNEL_ID, media=media_group)
+        if text_parts:
+            await context.bot.send_message(
+                chat_id=BACKUP_ANKET_CHANNEL_ID,
+                text="\n\n---\n\n".join(text_parts),
+                parse_mode='HTML'
+            )
+    except Exception as e:
+        logger.error(f"Не удалось отправить резервную копию анкеты {anketa_id} в BACKUP_ANKET_CHANNEL_ID: {e}")
+
+
 async def send_anketa(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     if not user:
@@ -1174,6 +1466,16 @@ async def send_anketa(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Напиши /anketa и добавь хотя бы один блок."
         )
         return
+
+    # Антиспам: не даём отправлять анкеты чаще, чем раз в ANKETA_COOLDOWN_MINUTES минут.
+    remaining = get_anketa_cooldown_remaining(user.id)
+    if remaining is not None:
+        minutes_left = max(1, int(remaining.total_seconds() // 60) + 1)
+        await update.message.reply_text(
+            f"⏳ Ты уже отправлял анкету недавно. Следующую можно отправить через {minutes_left} мин."
+        )
+        return
+    mark_anketa_submitted(user.id)
 
     # Сохраняем анкету в память
     anketa_id = str(uuid.uuid4())
@@ -1227,6 +1529,9 @@ async def send_anketa(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except TelegramError as e:
             logger.warning(f"Не удалось отправить стикер одобрения анкеты: {e}")
 
+        # Роль персонажа назначается нейронкой в фоне — не задерживаем ответ пользователю.
+        asyncio.create_task(assign_role_after_approval(context, user.id, user.username, full_text))
+
         # Анкета обработана (принята автоматически) — сразу чистим её из памяти.
         anketa_store.pop(anketa_id, None)
 
@@ -1252,6 +1557,11 @@ async def send_anketa(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except TelegramError:
             pass
         mod_note = "⚠️ Автоматическая проверка анкетологом была недоступна, анкета передана без неё."
+
+    # Сохраняем анкету в БД и дублируем в резервный канал — чтобы она не пропала,
+    # если бот перезапустится, пока висит на ручной проверке.
+    save_pending_anketa_to_db(anketa_id, user.id, user.username or user.first_name, items)
+    await send_anketa_backup_copy(context, anketa_id, user, items)
 
     # Отправляем модераторам
     for mod_id in DEVELOPER_IDS:
@@ -1402,8 +1712,9 @@ async def anketa_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # не заставляя его ждать ответа нейронки (у неё есть свои таймауты и фолбэк ниже).
         await query.edit_message_text("✅ Анкета одобрена.")
 
-        # Анкета обработана — сразу чистим её из памяти, дальше она уже не нужна.
+        # Анкета обработана — сразу чистим её из памяти и из БД, дальше она уже не нужна.
         anketa_store.pop(anketa_id, None)
+        delete_anketa_from_db(anketa_id)
 
         _, text_parts_for_comment = _build_anketa_media_group(ank["items"])
         anketa_text_for_comment = "\n\n---\n\n".join(text_parts_for_comment)
@@ -1417,6 +1728,9 @@ async def anketa_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await context.bot.send_sticker(chat_id=ank["user_id"], sticker=STICKER_ANKETA_APPROVE)
         except TelegramError as e:
             logger.warning(f"Не удалось отправить стикер одобрения анкеты: {e}")
+
+        # Роль персонажа назначается нейронкой в фоне — не задерживаем ответ модератору/пользователю.
+        asyncio.create_task(assign_role_after_approval(context, ank["user_id"], ank.get("username"), anketa_text_for_comment))
     else:
         ank["status"] = "rejected"
         ank["moderated_by"] = user.id
@@ -1426,6 +1740,7 @@ async def anketa_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text("❌ Анкета отклонена.")
 
         anketa_store.pop(anketa_id, None)
+        delete_anketa_from_db(anketa_id)
 
         _, text_parts_for_comment = _build_anketa_media_group(ank["items"])
         anketa_text_for_comment = "\n\n---\n\n".join(text_parts_for_comment)
@@ -1662,6 +1977,7 @@ async def set_commands(application: Application):
         BotCommand("start", "Запустить бота и начать диалог с Амадеусом"),
         BotCommand("help", "Показать список команд"),
         BotCommand("profile", "Посмотреть свой профиль"),
+        BotCommand("setrole", "Указать свою роль (имя персонажа) вручную"),
         BotCommand("anketa", "Создать анкету персонажа (по частям)"),
         BotCommand("cancel", "Отменить текущее заполнение анкеты"),
         BotCommand("send_anketa", "Отправить собранную анкету на модерацию"),
@@ -1687,6 +2003,13 @@ async def set_commands(application: Application):
 
 async def post_init(application: Application):
     await set_commands(application)
+
+    # Восстанавливаем анкеты, которые остались на ручной модерации после предыдущего запуска,
+    # чтобы они не пропадали при перезапуске бота.
+    restored = load_pending_anketas_from_db()
+    if restored:
+        anketa_store.update(restored)
+
     asyncio.create_task(cleanup_inactive_users_loop())
     logger.info(f"Запущена фоновая очистка неактивных пользователей (порог: {INACTIVE_DAYS_THRESHOLD} дней).")
 
@@ -1699,6 +2022,7 @@ def main():
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CommandHandler("profile", profile))
+    application.add_handler(CommandHandler("setrole", setrole))
     application.add_handler(CommandHandler("anketa", anketa))
     application.add_handler(CommandHandler("send_anketa", send_anketa))
     application.add_handler(CommandHandler("anketa_review", anketa_review))
