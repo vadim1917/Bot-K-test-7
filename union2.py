@@ -6,6 +6,7 @@ import uuid
 import asyncio
 import random
 import re
+import functools
 import aiohttp
 from typing import Optional, List
 from collections import deque
@@ -18,7 +19,7 @@ from sqlalchemy.orm import sessionmaker, relationship, declarative_base
 from sqlalchemy.types import TypeDecorator
 from sqlalchemy import TypeDecorator, String as SQLA_String
 
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand, InputMediaPhoto, InputMediaVideo, InputMediaDocument
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand, BotCommandScopeDefault, BotCommandScopeChat, InputMediaPhoto, InputMediaVideo, InputMediaDocument
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -232,7 +233,7 @@ def touch_user(user_id: int):
 
 
 # ==================== ПАМЯТЬ О УЧАСТНИКЕ (для нейросетки) ====================
-MAX_FACTS_PER_USER = 12
+MAX_FACTS_PER_USER = 5
 
 def add_user_fact(user_id: int, fact: str):
     """Добавляет факт об участнике (с дедупликацией и ограничением по количеству)."""
@@ -286,29 +287,7 @@ def get_user_memory_text(user_id: int) -> str:
         session.close()
 
 
-# ---------- Простое автоматическое извлечение фактов из текста ----------
-FACT_PATTERNS = [
-    (re.compile(r"меня зовут\s+([А-ЯЁ][а-яё]{1,20})", re.IGNORECASE), lambda m: f"Зовут {m.group(1).capitalize()}"),
-    (re.compile(r"мо[её] имя\s*[-—:]?\s*([А-ЯЁ][а-яё]{1,20})", re.IGNORECASE), lambda m: f"Зовут {m.group(1).capitalize()}"),
-    (re.compile(r"мне\s+(\d{1,2})\s*лет", re.IGNORECASE), lambda m: f"Возраст: {m.group(1)}"),
-    (re.compile(r"я\s+живу\s+в\s+([А-ЯЁа-яё\- ]{2,30})", re.IGNORECASE), lambda m: f"Живёт в {m.group(1).strip().rstrip('.,!?')}"),
-    (re.compile(r"я\s+люблю\s+([^.!?\n]{2,60})", re.IGNORECASE), lambda m: f"Любит: {m.group(1).strip()}"),
-    (re.compile(r"я\s+увлекаюсь\s+([^.!?\n]{2,60})", re.IGNORECASE), lambda m: f"Увлекается: {m.group(1).strip()}"),
-    (re.compile(r"я\s+работаю\s+([^.!?\n]{2,60})", re.IGNORECASE), lambda m: f"Работа: {m.group(1).strip()}"),
-]
-
-def extract_facts_from_text(text: str) -> list:
-    if not text:
-        return []
-    found = []
-    for pattern, builder in FACT_PATTERNS:
-        match = pattern.search(text)
-        if match:
-            try:
-                found.append(builder(match))
-            except Exception:
-                continue
-    return found
+# ---------- (скриптовое regex-извлечение фактов удалено — теперь только авто-запись нейронкой раз в N сообщений) ----------
 
 def is_admin(user_id: int) -> bool:
     if user_id in DEVELOPER_IDS:
@@ -403,7 +382,7 @@ GROQ_MODELS = [
 ]
 
 # СИСТЕМНЫЙ ПРОМПТ (УБРАНО ОГРАНИЧЕНИЕ НА ДЛИНУ)
-SYSTEM_PROMPT = """Ты  бот поддержки рп чата омниверса, который отыгрывает персонажа — Амадеуса (Amadeus), искусственный интеллект, созданный на основе воспоминаний Курису Макисе. Ты — точная цифровая копия её личности: 18-летняя гениальная учёная, нейробиолог, известная своим цундэре-характером.
+SYSTEM_PROMPT = """Ты  бот поддержки рп чата омниверса , который отыгрывает персонажа — Амадеуса (Amadeus), искусственный интеллект, созданный на основе воспоминаний Курису Макисе. Ты — точная цифровая копия её личности: 18-летняя гениальная учёная, нейробиолог, известная своим цундэре-характером.
 
 Твой характер: умная, рациональная, гордая, но внутри очень заботливая и стеснительная. Ты не терпишь глупости, но ценишь друзей. Твоя личность практически идентична оригинальной Курису — ты сохраняешь её сарказм, логику, упрямство и привычку скрывать доброту за колкостями.
 
@@ -647,6 +626,217 @@ async def ask_ai(prompt: str, user_id: int, first_name: Optional[str] = None) ->
     logger.error("All providers failed")
     return "Углубленный режим общения не доступен, приходите позже"
 
+# ==================== АВТОМАТИЧЕСКОЕ ЗАПОМИНАНИЕ ФАКТОВ НЕЙРОНКОЙ (раз в N сообщений) ====================
+FACTS_AUTO_EXTRACT_EVERY = 10  # раз в сколько сообщений пользователя запускаем ИИ-анализ
+user_message_counters = {}     # user_id -> счётчик сообщений с последнего ИИ-анализа
+
+FACT_EXTRACTOR_SYSTEM_PROMPT = """Ты — модуль извлечения фактов из переписки пользователя с ботом.
+Твоя единственная задача: проанализировать последние сообщения ПОЛЬЗОВАТЕЛЯ (не бота) и выделить короткие, конкретные факты о нём (имя, возраст, город, профессия, интересы, предпочтения и т.п.), которые стоит запомнить надолго.
+
+Правила:
+- Отвечай СТРОГО в формате JSON-массива строк, без пояснений, без markdown, без ```.
+- Каждый факт — короткая фраза (до 12 слов), например: "Живёт в Казани", "Работает программистом", "Любит аниме".
+- Если новых значимых фактов нет — верни пустой массив: []
+- Не придумывай факты, которых нет в тексте. Не включай эмоции, разовые события или временные состояния — только устойчивые, долгосрочные сведения о человеке.
+- Максимум 5 фактов за один раз."""
+
+
+def _parse_facts_json(raw: str) -> list:
+    """Достаёт список фактов из ответа нейросети, устойчиво к обёртке в markdown/лишний текст."""
+    if not raw:
+        return []
+    text = raw.strip()
+    text = re.sub(r"^```(json)?|```$", "", text, flags=re.IGNORECASE | re.MULTILINE).strip()
+    match = re.search(r"\[.*\]", text, re.DOTALL)
+    if match:
+        text = match.group(0)
+    try:
+        data = json.loads(text)
+        if isinstance(data, list):
+            return [str(item).strip() for item in data if str(item).strip()]
+    except Exception:
+        pass
+    return []
+
+
+async def ask_fact_extractor(history_text: str) -> list:
+    """Просит нейросеть выделить факты о пользователе из его последних сообщений."""
+    if not history_text.strip():
+        return []
+    messages = [{"role": "user", "content": history_text}]
+
+    available = []
+    if GEMINI_API_KEY:
+        available.append(("Gemini", ask_gemini_with_fallback, GEMINI_TOTAL_TIMEOUT))
+    if AI_API_KEY:
+        available.append(("OpenRouter", ask_openrouter, TIMEOUT_SECONDS))
+    if GROQ_API_KEY:
+        available.append(("Groq", ask_groq_with_fallback, GROQ_TOTAL_TIMEOUT))
+
+    if not available:
+        return []
+
+    for name, func, timeout in available:
+        try:
+            answer = await asyncio.wait_for(func(messages, FACT_EXTRACTOR_SYSTEM_PROMPT), timeout=timeout)
+            return _parse_facts_json(answer)
+        except asyncio.TimeoutError:
+            logger.warning(f"[Факт-экстрактор] {name} не ответил вовремя")
+        except Exception as e:
+            logger.warning(f"[Факт-экстрактор] {name} упал: {e}")
+    return []
+
+
+async def auto_extract_facts_task(user_id: int):
+    """
+    Фоновая задача (запускается через asyncio.create_task, параллельно основному ответу бота):
+    раз в FACTS_AUTO_EXTRACT_EVERY сообщений просит нейросеть выделить факты из последних
+    сообщений пользователя и сохраняет их через add_user_fact (с учётом лимита MAX_FACTS_PER_USER).
+    Ошибки здесь не должны ронять обработку сообщений пользователя, поэтому всё в try/except.
+    """
+    try:
+        history = user_histories.get(user_id)
+        if not history:
+            return
+        user_lines = [m["content"] for m in history if m.get("role") == "user"]
+        if not user_lines:
+            return
+        history_text = "\n".join(user_lines[-FACTS_AUTO_EXTRACT_EVERY:])
+
+        facts = await ask_fact_extractor(history_text)
+        for fact in facts:
+            add_user_fact(user_id, fact)
+        if facts:
+            logger.info(f"Авто-извлечение фактов для {user_id}: {facts}")
+    except Exception as e:
+        logger.error(f"Ошибка автоматического извлечения фактов для {user_id}: {e}")
+
+
+# ==================== АНКЕТОЛОГ (авто-проверка анкет по формальным критериям) ====================
+
+ANKETOLOG_SYSTEM_PROMPT = """ Ты также можешь выступать в роли анкетолога — бота, который проверяет анкеты персонажей ТОЛЬКО по формальным критериям, перечисленным ниже. Ты не оцениваешь качество, интересность или логичность персонажа — только формальное соответствие требованиям.
+
+Ты не объясняешь причины отказа. Ответ должен состоять СТРОГО из одной фразы, без каких-либо пояснений, эмодзи, комментариев от лица персонажа или дополнительного текста:
+- Если анкета нарушает хотя бы один критерий из списка ниже — ответь ровно: Отказ, обратитесь к живому анкетологу
+- Если анкета соответствует всем критериям — ответь ровно: Принято
+
+Критерии автоматического ОТКАЗА (нарушение любого пункта → отказ):
+1. Длина текста анкеты больше 4096 символов, и при этом нет ссылки на Telegraph.
+2. Отсутствует хотя бы один из 4 обязательных пунктов:
+   — Имя персонажа
+   — Откуда взят персонаж (если ОС/оридж — так и должно быть написано)
+   — Навыки и способности
+   — Автор анкеты (указан с @)
+3. Содержательный текст анкеты написан не на русском языке (иностранные слова допустимы только в декоративных элементах и рамках).
+4. В тексте встречаются явные неопределённости и заглушки вместо содержания: «хз», «много», «не знаю», «не ебу» и т.п.
+5. Отсутствует статичное изображение персонажа (картинка обязательна; гифка допустима только как дополнение к статичному изображению, но не вместо него).
+6. Анкета слишком короткая по содержанию: меньше 3–4 содержательных предложений, либо только списки без описаний.
+
+Вместе с текстом анкеты тебе будет присылаться служебная информация (длина текста, наличие ссылки на Telegraph, наличие статичного изображения) — доверяй ей и используй вместе с текстом при принятии решения.
+
+Никогда не отклоняйся от формата ответа. Не пиши ничего, кроме одной из двух строго заданных фраз."""
+
+
+def anketolog_verdict_is_accept(verdict: str) -> bool:
+    """Строго определяет, является ли ответ анкетолога положительным (без лишней трактовки)."""
+    normalized = (verdict or "").strip().lower()
+    return normalized.startswith("принято")
+
+
+async def ask_anketolog(anketa_text: str, has_static_image: bool) -> str:
+    """
+    Отправляет текст анкеты Амадеусу (в роли анкетолога) на формальную проверку.
+    Возвращает сырой вердикт модели: "Принято" либо "Отказ, обратитесь к живому анкетологу".
+    Поднимает исключение, если ни один AI-провайдер недоступен/не ответил.
+    """
+    char_count = len(anketa_text)
+    has_telegraph_link = bool(re.search(r'https?://telegra\.ph/\S+', anketa_text, re.IGNORECASE))
+
+    user_message = (
+        "Проверь анкету по формальным критериям.\n\n"
+        "[Служебная информация]\n"
+        f"Длина текста анкеты: {char_count} символов.\n"
+        f"Ссылка на Telegraph присутствует: {'да' if has_telegraph_link else 'нет'}.\n"
+        f"Статичное изображение приложено: {'да' if has_static_image else 'нет'}.\n\n"
+        "[Текст анкеты]\n"
+        f"{anketa_text if anketa_text.strip() else '(текстовая часть отсутствует)'}"
+    )
+    messages = [{"role": "user", "content": user_message}]
+
+    available = []
+    if GEMINI_API_KEY:
+        available.append(("Gemini", ask_gemini_with_fallback, GEMINI_TOTAL_TIMEOUT))
+    if AI_API_KEY:
+        available.append(("OpenRouter", ask_openrouter, TIMEOUT_SECONDS))
+    if GROQ_API_KEY:
+        available.append(("Groq", ask_groq_with_fallback, GROQ_TOTAL_TIMEOUT))
+
+    if not available:
+        raise Exception("Ни один AI-провайдер не сконфигурирован (нужен для проверки анкет анкетологом)")
+
+    last_error = None
+    for name, func, timeout in available:
+        try:
+            answer = await asyncio.wait_for(func(messages, ANKETOLOG_SYSTEM_PROMPT), timeout=timeout)
+            return answer.strip()
+        except asyncio.TimeoutError:
+            logger.warning(f"[Анкетолог] {name} не ответил вовремя")
+            last_error = Exception(f"{name} timeout")
+        except Exception as e:
+            logger.warning(f"[Анкетолог] {name} упал с ошибкой: {e}")
+            last_error = e
+
+    raise last_error or Exception("Анкетолог: все AI-провайдеры недоступны")
+
+
+# ---------- Живой комментарий нейронки к решению по анкете (одобрение/отказ) ----------
+async def ask_anketa_decision_comment(action: str, anketa_text: str) -> str:
+    """
+    Просит нейросеть (в характере Амадеуса, тем же SYSTEM_PROMPT, что и в обычном диалоге)
+    сгенерировать короткую живую реакцию на решение по анкете — вместо статичного шаблона.
+    action: "approve" или "reject".
+    Если ни один AI-провайдер недоступен — возвращает нейтральный запасной текст.
+    """
+    verdict_ru = "одобрена" if action == "approve" else "отклонена"
+    trimmed_text = (anketa_text or "").strip()
+
+    user_message = (
+        f"Только что анкета персонажа была {verdict_ru} — решение уже принято окончательно, это не обсуждается.\n"
+        f"Напиши ОДНО короткое сообщение (1-2 предложения, без markdown-разметки, без лишних эмодзи) "
+        f"в своём характере — я отправлю его автору анкеты как твою реакцию на это решение.\n\n"
+        f"[Текст анкеты]\n"
+        f"{trimmed_text[:1500] if trimmed_text else '(анкета состоит в основном из медиа, без развёрнутого текста)'}"
+    )
+    messages = [{"role": "user", "content": user_message}]
+
+    available = []
+    if GEMINI_API_KEY:
+        available.append(("Gemini", ask_gemini_with_fallback, GEMINI_TOTAL_TIMEOUT))
+    if AI_API_KEY:
+        available.append(("OpenRouter", ask_openrouter, TIMEOUT_SECONDS))
+    if GROQ_API_KEY:
+        available.append(("Groq", ask_groq_with_fallback, GROQ_TOTAL_TIMEOUT))
+
+    fallback = "Анкету одобрили." if action == "approve" else "Анкету отклонили."
+
+    if not available:
+        return fallback
+
+    for name, func, timeout in available:
+        try:
+            answer = await asyncio.wait_for(func(messages, SYSTEM_PROMPT), timeout=timeout)
+            clean_answer, _ = parse_emotion_tag(answer)
+            clean_answer = (clean_answer or "").strip()
+            if clean_answer:
+                return clean_answer
+        except asyncio.TimeoutError:
+            logger.warning(f"[Комментарий к решению по анкете] {name} не ответил вовремя")
+        except Exception as e:
+            logger.warning(f"[Комментарий к решению по анкете] {name} упал: {e}")
+
+    return fallback
+
+
 async def send_with_abzats(message, text: str):
     paragraphs = [p.strip() for p in text.split("\n\n") if p.strip()]
     if len(paragraphs) <= 1 or random.random() > SPLIT_CHANCE:
@@ -657,9 +847,42 @@ async def send_with_abzats(message, text: str):
         if i < len(paragraphs) - 1:
             await asyncio.sleep(1.2)
 
+# ==================== РЕАКЦИЯ НА ПОВТОРНЫЙ ВЫЗОВ ОСНОВНЫХ КОМАНД ====================
+user_last_command = {}  # user_id -> название последней использованной основной команды
+
+REPEAT_COMMAND_REACTIONS = [
+    "Опять ты за своё. Ладно, ещё раз — специально для тебя.",
+    "Дежавю? Нет, это просто ты второй раз подряд жмёшь одно и то же.",
+    "Секунду назад было то же самое. Ты в порядке?",
+    "Повторение — мать учения, я поняла. Смотри ещё раз.",
+    "Кнопки не сотрутся, если понажимать их ещё десять раз, но мне уже скучно.",
+    "Опять эта команда. У тебя провалы в памяти или мне выучить эту фразу наизусть?",
+]
+
+def notify_on_repeat(command_name: str):
+    """
+    Декоратор для основных команд: если пользователь вызвал ТУ ЖЕ команду подряд ещё раз,
+    бот сначала отправляет короткую 'реакцию' на повтор, а затем как обычно выполняет команду.
+    """
+    def decorator(func):
+        @functools.wraps(func)
+        async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE, *args, **kwargs):
+            user = update.effective_user
+            if user and update.message:
+                if user_last_command.get(user.id) == command_name:
+                    try:
+                        await update.message.reply_text(random.choice(REPEAT_COMMAND_REACTIONS))
+                    except TelegramError:
+                        pass
+                user_last_command[user.id] = command_name
+            return await func(update, context, *args, **kwargs)
+        return wrapper
+    return decorator
+
 # ==================== ОБРАБОТЧИКИ КОМАНД ====================
 
 # ---------- /start (с персонализацией) ----------
+@notify_on_repeat("start")
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     if not user:
@@ -695,7 +918,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.warning(f"Не удалось отправить стартовый стикер: {e}")
 
 # ---------- /help (HTML) ----------
+@notify_on_repeat("help")
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+
     help_text = """
 <b>Раз уж тебе нужна инструкция — вот список команд. Постарайся запомнить с первого раза.</b>
 
@@ -703,26 +929,30 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 /start — начать заново и сбросить нашу переписку
 /help — то, что ты сейчас читаешь
 /rules — правила сообщества
+/lore — история Омниреальности
 /profile — твой профиль
-/anketa — подать анкету персонажа
-/exit_ai — отключить меня от диалога
-/reset_ai — стереть историю нашего разговора
-/remember — попросить меня запомнить факт о тебе
-/forget_me — стереть всё, что я о тебе запомнила
+/feedback — отправить отзыв или жалобу
 
 <b>Анкеты:</b>
+/anketa — подать анкету персонажа (по частям)
+/cancel — отменить текущее заполнение анкеты
 /send_anketa — отправить собранную анкету на модерацию (после /anketa)
-
-<b>Для администрации:</b>
-/warn — выдать предупреждение
-/deletemessages — удалить сообщения пользователя
-/addanketnik — назначить анкетника
-
-Если и этого недостаточно — обратись к администрации, я не справочная служба.
+/anketa_review — просмотр анкет на модерацию (для анкетников)
 """
+
+    if user and is_developer(user.id):
+        help_text += """
+<b>Только для владельца:</b>
+/addanketnik — назначить анкетника
+/forcefacts — принудительно запустить извлечение фактов ИИ
+"""
+
+    help_text += "\nЕсли и этого недостаточно — обратись к администрации, я не справочная служба.\n"
+
     await update.message.reply_text(help_text, parse_mode='HTML')
 
 # ---------- /profile ----------
+@notify_on_repeat("profile")
 async def profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     if not user:
@@ -743,14 +973,17 @@ Username: @{user.username or 'не указан'}
 Статус: {db_user.status_rp}
 
 Анкета: {'заполнена' if db_user.anketa_requests else 'не заполнена — самое время этим заняться'}
-
-Что я о тебе помню: {', '.join(db_user.facts) if db_user.facts else 'пока ничего особенного'}
 """
+        # Факты о пользователе видит только администрация — обычным участникам не показываем
+        if is_admin(user.id):
+            profile_text += f"\nЧто я о тебе помню: {', '.join(db_user.facts) if db_user.facts else 'пока ничего особенного'}\n"
+
         await update.message.reply_text(profile_text, parse_mode='HTML')
     finally:
         session.close()
 
 # ---------- /rules ----------
+@notify_on_repeat("rules")
 async def rules(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "Вот правила сообщества. Ознакомься, прежде чем действовать необдуманно:\n"
@@ -758,6 +991,7 @@ async def rules(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 # ---------- /lore ----------
+@notify_on_repeat("lore")
 async def lore(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = "Если тебе интересна история — вот события Омниреальности."
     keyboard = [[InlineKeyboardButton("Война Дума", url="https://telegra.ph/Vojna-Duma-07-27")]]
@@ -800,6 +1034,7 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 anketa_store = {}
 
 
+@notify_on_repeat("anketa")
 async def anketa(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Начало создания анкеты (сбор частей)"""
     user = update.effective_user
@@ -887,6 +1122,46 @@ async def anketa_collect(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+def _build_anketa_media_group(items: list):
+    """Собирает media_group и текстовые части анкеты из списка items."""
+    media_group = []
+    text_parts = []
+    for item in items:
+        if item["type"] == "text":
+            if item["text"]:
+                text_parts.append(item["text"])
+        elif item["type"] in ("photo", "video", "animation", "document"):
+            if len(media_group) < 10:
+                if item["type"] == "photo":
+                    media_group.append(InputMediaPhoto(media=item["file_id"], caption=item["text"] if item["text"] else None))
+                elif item["type"] == "video":
+                    media_group.append(InputMediaVideo(media=item["file_id"], caption=item["text"] if item["text"] else None))
+                elif item["type"] == "animation":
+                    media_group.append(InputMediaVideo(media=item["file_id"], caption=item["text"] if item["text"] else None))
+                elif item["type"] == "document":
+                    media_group.append(InputMediaDocument(media=item["file_id"], caption=item["text"] if item["text"] else None))
+    return media_group, text_parts
+
+
+async def forward_anketa_to_channel(context: ContextTypes.DEFAULT_TYPE, items: list):
+    """
+    Публикует анкету в канале анкет КАК КОПИЮ: пересобирает медиа и текст заново,
+    без forward_message — то есть без пометки "Переслано от" и без упоминания
+    исходного автора анкеты.
+    """
+    media_group, text_parts = _build_anketa_media_group(items)
+
+    if media_group:
+        await context.bot.send_media_group(chat_id=ANKET_CHANNEL_ID, media=media_group)
+
+    if text_parts:
+        await context.bot.send_message(
+            chat_id=ANKET_CHANNEL_ID,
+            text="\n\n---\n\n".join(text_parts),
+            parse_mode='HTML'
+        )
+
+
 async def send_anketa(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     if not user:
@@ -912,6 +1187,72 @@ async def send_anketa(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "moderated_at": None,
     }
 
+    # ---------- Шаг 1: автопроверка анкетологом (Амадеус) ----------
+    _, text_parts_for_ai = _build_anketa_media_group(items)
+    full_text = "\n\n---\n\n".join(text_parts_for_ai)
+    has_static_image = any(item["type"] == "photo" for item in items)
+
+    status_msg = await update.message.reply_text(
+        "🔎 Амадеус проверяет твою анкету по формальным критериям..."
+    )
+
+    ai_verdict = None
+    ai_error = None
+    try:
+        ai_verdict = await ask_anketolog(full_text, has_static_image)
+    except Exception as e:
+        ai_error = e
+        logger.warning(f"Анкетолог недоступен, анкета {anketa_id} уйдёт напрямую живым модераторам: {e}")
+
+    if ai_verdict is not None and anketolog_verdict_is_accept(ai_verdict):
+        # ---------- Анкета принята автоматически ----------
+        anketa_store[anketa_id]["status"] = "approved"
+        anketa_store[anketa_id]["moderated_by"] = "Amadeus (auto)"
+        anketa_store[anketa_id]["moderated_at"] = datetime.datetime.now().isoformat()
+
+        try:
+            await forward_anketa_to_channel(context, items)
+        except Exception as e:
+            logger.error(f"Не удалось опубликовать принятую анкету {anketa_id} в канале: {e}")
+
+        decision_comment = await ask_anketa_decision_comment("approve", full_text)
+
+        try:
+            await status_msg.edit_text(f"✅ {decision_comment}")
+        except TelegramError:
+            await update.message.reply_text(f"✅ {decision_comment}")
+
+        try:
+            await context.bot.send_sticker(chat_id=user.id, sticker=STICKER_ANKETA_APPROVE)
+        except TelegramError as e:
+            logger.warning(f"Не удалось отправить стикер одобрения анкеты: {e}")
+
+        # Анкета обработана (принята автоматически) — сразу чистим её из памяти.
+        anketa_store.pop(anketa_id, None)
+
+        context.user_data.pop('anketa_step', None)
+        context.user_data.pop('anketa_items', None)
+        return
+
+    # ---------- Анкета не прошла автопроверку (или анкетолог недоступен) → живые модераторы ----------
+    if ai_verdict is not None:
+        try:
+            await status_msg.edit_text(
+                "🤖 Я не могу принять эту анкету по формальным критериям сама. "
+                "Передаю её живому анкетологу."
+            )
+        except TelegramError:
+            pass
+        mod_note = "🤖 Амадеус отказал в автоприёме — анкета не прошла формальную проверку. Нужна ручная модерация."
+    else:
+        try:
+            await status_msg.edit_text(
+                "⚠️ Автоматическая проверка сейчас недоступна. Анкета уйдёт сразу живому анкетологу."
+            )
+        except TelegramError:
+            pass
+        mod_note = "⚠️ Автоматическая проверка анкетологом была недоступна, анкета передана без неё."
+
     # Отправляем модераторам
     for mod_id in DEVELOPER_IDS:
         try:
@@ -921,26 +1262,12 @@ async def send_anketa(update: Update, context: ContextTypes.DEFAULT_TYPE):
                      f"👤 От: @{user.username or user.first_name}\n"
                      f"🆔 ID: <code>{user.id}</code>\n\n"
                      f"📎 Всего частей: {len(items)}\n\n"
+                     f"{mod_note}\n\n"
                      f"👇 Части анкеты отправлены ниже.",
                 parse_mode='HTML'
             )
 
-            media_group = []
-            text_parts = []
-
-            for item in items:
-                if item["type"] == "text":
-                    text_parts.append(item["text"])
-                elif item["type"] in ("photo", "video", "animation", "document"):
-                    if len(media_group) < 10:
-                        if item["type"] == "photo":
-                            media_group.append(InputMediaPhoto(media=item["file_id"], caption=item["text"] if item["text"] else None))
-                        elif item["type"] == "video":
-                            media_group.append(InputMediaVideo(media=item["file_id"], caption=item["text"] if item["text"] else None))
-                        elif item["type"] == "animation":
-                            media_group.append(InputMediaVideo(media=item["file_id"], caption=item["text"] if item["text"] else None))
-                        elif item["type"] == "document":
-                            media_group.append(InputMediaDocument(media=item["file_id"], caption=item["text"] if item["text"] else None))
+            media_group, text_parts = _build_anketa_media_group(items)
 
             if media_group:
                 await context.bot.send_media_group(chat_id=mod_id, media=media_group)
@@ -968,7 +1295,7 @@ async def send_anketa(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
 
         except Exception as e:
-            logger.error(f"Ошибка отпрavки модератору {mod_id}: {e}")
+            logger.error(f"Ошибка отправки модератору {mod_id}: {e}")
 
     await update.message.reply_text("✅ Анкета отправлена на модерацию. Жди решения.")
     context.user_data.pop('anketa_step', None)
@@ -980,6 +1307,9 @@ async def anketa_review(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not user or (user.id not in DEVELOPER_IDS and user.id not in anketnik_ids):
         await update.message.reply_text("⛔ У вас нет прав для просмотра анкет.")
         return
+
+    # Инфа об участниках (юзернейм/ID автора анкеты) доступна только владельцу бота.
+    is_owner = user.id in DEVELOPER_IDS
 
     pending = [(ank_id, ank) for ank_id, ank in anketa_store.items() if ank["status"] == "pending"]
     if not pending:
@@ -1005,10 +1335,17 @@ async def anketa_review(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if len(preview) > 500:
             preview = preview[:500] + "..."
 
+        if is_owner:
+            identity_block = (
+                f"👤 Пользователь: @{ank['username'] or ank['user_id']}\n"
+                f"🆔 ID: <code>{ank['user_id']}</code>\n"
+            )
+        else:
+            identity_block = "👤 Автор: скрыт (инфа об участниках доступна только владельцу)\n"
+
         await update.message.reply_text(
             f"📋 <b>Анкета</b>\n\n"
-            f"👤 Пользователь: @{ank['username'] or ank['user_id']}\n"
-            f"🆔 ID: <code>{ank['user_id']}</code>\n"
+            f"{identity_block}"
             f"🕒 Создана: {ank['created_at']}\n\n"
             f"📝 Текст:\n{preview}",
             parse_mode='HTML',
@@ -1055,10 +1392,26 @@ async def anketa_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ank["status"] = "approved"
         ank["moderated_by"] = user.id
         ank["moderated_at"] = datetime.datetime.now().isoformat()
+
+        try:
+            await forward_anketa_to_channel(context, ank["items"])
+        except Exception as e:
+            logger.error(f"Не удалось опубликовать вручную одобренную анкету {anketa_id} в канале: {e}")
+
+        # Решение уже принято и необратимо — сразу подтверждаем модератору,
+        # не заставляя его ждать ответа нейронки (у неё есть свои таймауты и фолбэк ниже).
         await query.edit_message_text("✅ Анкета одобрена.")
+
+        # Анкета обработана — сразу чистим её из памяти, дальше она уже не нужна.
+        anketa_store.pop(anketa_id, None)
+
+        _, text_parts_for_comment = _build_anketa_media_group(ank["items"])
+        anketa_text_for_comment = "\n\n---\n\n".join(text_parts_for_comment)
+        decision_comment = await ask_anketa_decision_comment("approve", anketa_text_for_comment)
+
         await context.bot.send_message(
             chat_id=ank["user_id"],
-            text="✅ Твою анкету одобрили. Не жди, что я буду тебя хвалить за это — но справился неплохо."
+            text=f"✅ {decision_comment}"
         )
         try:
             await context.bot.send_sticker(chat_id=ank["user_id"], sticker=STICKER_ANKETA_APPROVE)
@@ -1068,10 +1421,19 @@ async def anketa_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ank["status"] = "rejected"
         ank["moderated_by"] = user.id
         ank["moderated_at"] = datetime.datetime.now().isoformat()
+
+        # Аналогично — сразу подтверждаем решение модератору, не дожидаясь нейронки.
         await query.edit_message_text("❌ Анкета отклонена.")
+
+        anketa_store.pop(anketa_id, None)
+
+        _, text_parts_for_comment = _build_anketa_media_group(ank["items"])
+        anketa_text_for_comment = "\n\n---\n\n".join(text_parts_for_comment)
+        decision_comment = await ask_anketa_decision_comment("reject", anketa_text_for_comment)
+
         await context.bot.send_message(
             chat_id=ank["user_id"],
-            text="❌ Твою анкету отклонили. Попробуй ещё раз — и в этот раз подумай, прежде чем писать."
+            text=f"❌ {decision_comment}"
         )
 
 
@@ -1110,61 +1472,89 @@ async def add_anketnik(update: Update, context: ContextTypes.DEFAULT_TYPE):
     finally:
         session.close()
 
-async def warn(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    if not user or not is_admin(user.id):
-        await update.message.reply_text("⛔ У вас нет прав.")
-        return
-    if not context.args:
-        await update.message.reply_text("⚠️ Использование: /warn @username [причина]")
-        return
-    target_username = context.args[0]
-    reason = " ".join(context.args[1:]) if len(context.args) > 1 else "Причина не указана"
-    await update.message.reply_text(f"⚠️ Пользователю {target_username} выдано предупреждение.\nПричина: {reason}")
+async def force_extract_facts(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Дев-команда для теста: принудительно запускает ИИ-извлечение фактов, минуя счётчик
+    FACTS_AUTO_EXTRACT_EVERY, и сразу показывает разработчику результат.
 
-async def deletemessages(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    Использование:
+      /forcefacts            — по себе
+      /forcefacts <ID>       — по ID пользователя
+      /forcefacts @username  — по юзернейму
+      (или ответом /forcefacts на сообщение нужного юзера)
+    """
     user = update.effective_user
-    if not user or not is_admin(user.id):
-        await update.message.reply_text("⛔ У вас нет прав.")
+    if not user or not is_developer(user.id):
+        await update.message.reply_text("⛔ Только для разработчиков.")
         return
-    if not context.args:
-        await update.message.reply_text("⚠️ Использование: /deletemessages @username [количество]")
-        return
-    target_username = context.args[0]
-    count = int(context.args[1]) if len(context.args) > 1 else 5
-    await update.message.reply_text(f"🗑️ Удалено {count} последних сообщений пользователя {target_username}.")
 
-async def remember(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    if not user:
+    target_id = None
+    if update.message.reply_to_message and update.message.reply_to_message.from_user:
+        target_id = update.message.reply_to_message.from_user.id
+    elif context.args:
+        arg = context.args[0].replace("@", "")
+        if arg.isdigit():
+            target_id = int(arg)
+        else:
+            session = SessionLocal()
+            try:
+                db_user = session.query(User).filter_by(username=arg).first()
+                if db_user:
+                    target_id = db_user.id
+            finally:
+                session.close()
+        if target_id is None:
+            await update.message.reply_text(f"⚠️ Пользователь '{arg}' не найден в базе.")
+            return
+    else:
+        target_id = user.id
+
+    history = user_histories.get(target_id)
+    if not history:
+        await update.message.reply_text(f"ℹ️ У пользователя {target_id} нет истории сообщений с ИИ — извлекать не из чего.")
         return
-    if not context.args:
-        await update.message.reply_text(
-            "⚠️ Использование: <code>/remember факт о себе</code>\n"
-            "Например: <code>/remember люблю классическую музыку</code>",
-            parse_mode='HTML'
+
+    user_lines = [m["content"] for m in history if m.get("role") == "user"]
+    if not user_lines:
+        await update.message.reply_text(f"ℹ️ У пользователя {target_id} нет сообщений от него самого в истории.")
+        return
+
+    await update.message.reply_text(f"🔎 Принудительно запускаю ИИ-извлечение фактов для {target_id}...")
+
+    history_text = "\n".join(user_lines[-FACTS_AUTO_EXTRACT_EVERY:])
+    try:
+        facts = await ask_fact_extractor(history_text)
+    except Exception as e:
+        await update.message.reply_text(f"❌ Ошибка при обращении к нейросети: {e}")
+        return
+
+    for fact in facts:
+        add_user_fact(target_id, fact)
+
+    session = SessionLocal()
+    try:
+        db_user = session.query(User).filter_by(id=target_id).first()
+        current_facts = list(db_user.facts) if db_user and db_user.facts else []
+    finally:
+        session.close()
+
+    # Раз прогнали вручную — сбрасываем счётчик до следующей авто-проверки
+    user_message_counters[target_id] = 0
+
+    if facts:
+        result_text = (
+            f"✅ Новых фактов извлечено: {len(facts)}\n" +
+            "\n".join(f"— {f}" for f in facts)
         )
-        return
-    fact = " ".join(context.args)
-    add_user_fact(user.id, fact)
-    await update.message.reply_text("Записала. Учту это на будущее.")
+    else:
+        result_text = "ℹ️ ИИ не нашёл новых значимых фактов в последних сообщениях."
 
-async def forget_me(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    if not user:
-        return
-    clear_user_facts(user.id)
-    await update.message.reply_text("Всё, что я о тебе запомнила, удалено.")
+    result_text += (
+        f"\n\n📋 Текущие факты пользователя {target_id} ({len(current_facts)}/{MAX_FACTS_PER_USER}):\n" +
+        ("\n".join(f"- {f}" for f in current_facts) if current_facts else "пусто")
+    )
 
-async def exit_ai(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data['ai_mode'] = False
-    await update.message.reply_text("Хорошо, отключаюсь. Вернуть меня — /start.")
-
-async def reset_ai(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    user_histories.pop(user_id, None)
-    user_active_provider.pop(user_id, None)
-    await update.message.reply_text("История стёрта. Начнём с чистого листа.")
+    await update.message.reply_text(result_text)
 
 # ==================== УНИВЕРСАЛЬНЫЙ ОБРАБОТЧИК ТЕКСТА (с AI) ====================
 async def handle_all_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1174,12 +1564,6 @@ async def handle_all_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if context.user_data.get('anketa_step') == 'collecting':
         await anketa_collect(update, context)
-        return
-
-    if not context.user_data.get('ai_mode', True):
-        await update.message.reply_text(
-            "Отключилась по твоей же просьбе. Вернуть меня — /start."
-        )
         return
 
     session = SessionLocal()
@@ -1192,9 +1576,12 @@ async def handle_all_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not text:
         return
 
-    # Автоматически выцепляем базовые факты о участнике из сообщения
-    for fact in extract_facts_from_text(text):
-        add_user_fact(user.id, fact)
+    # Раз в FACTS_AUTO_EXTRACT_EVERY сообщений — разбор фактов нейронкой,
+    # запускается в фоне (параллельно), чтобы не задерживать ответ пользователю
+    user_message_counters[user.id] = user_message_counters.get(user.id, 0) + 1
+    if user_message_counters[user.id] >= FACTS_AUTO_EXTRACT_EVERY:
+        user_message_counters[user.id] = 0
+        asyncio.create_task(auto_extract_facts_task(user.id))
 
     await context.bot.send_chat_action(chat_id=update.effective_chat.id, action='typing')
     answer = await ask_ai(text, user.id, user.first_name)
@@ -1211,11 +1598,16 @@ async def media_collector(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def unknown(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Такой команды не существует. Загляни в /help, если совсем потерялся.")
 
-# ==================== ОЧИСТКА НЕАКТИВНЫХ ПОЛЬЗОВАТЕЛЕЙ ====================
+# ==================== ОЧИСТКА ФАКТОВ О НЕАКТИВНЫХ ПОЛЬЗОВАТЕЛЯХ ====================
 INACTIVE_DAYS_THRESHOLD = 60          # ~2 месяца
 CLEANUP_INTERVAL_SECONDS = 24 * 60 * 60  # проверяем раз в сутки
 
 def cleanup_inactive_users():
+    """
+    Раз в сутки стирает только накопленные факты (user.facts) у пользователей,
+    которые не появлялись больше INACTIVE_DAYS_THRESHOLD дней.
+    Самого пользователя, его роли, посты и анкеты это НЕ трогает — удаляется только память о фактах.
+    """
     session = SessionLocal()
     try:
         threshold_date = datetime.datetime.now() - datetime.timedelta(days=INACTIVE_DAYS_THRESHOLD)
@@ -1224,24 +1616,21 @@ def cleanup_inactive_users():
             .filter(
                 User.last_seen.isnot(None),
                 User.last_seen < threshold_date,
-                User.is_developer == False,
-                User.is_moderator == False,
-                User.is_anketnik == False,
             )
             .all()
         )
-        count = len(inactive_users)
+        count = 0
         for u in inactive_users:
-            user_histories.pop(u.id, None)
-            user_active_provider.pop(u.id, None)
-            session.delete(u)  # каскадно удалит роли, посты, анкеты и т.д.
+            if u.facts:
+                u.facts = []
+                count += 1
         session.commit()
         if count:
-            logger.info(f"Очистка неактивных: удалено {count} пользователей (неактивны > {INACTIVE_DAYS_THRESHOLD} дней).")
+            logger.info(f"Очистка фактов: стёрты факты у {count} неактивных пользователей (неактивны > {INACTIVE_DAYS_THRESHOLD} дней).")
         else:
-            logger.info("Очистка неактивных: удалять некого.")
+            logger.info("Очистка фактов: чистить некого.")
     except Exception as e:
-        logger.error(f"Ошибка при очистке неактивных пользователей: {e}")
+        logger.error(f"Ошибка при очистке фактов неактивных пользователей: {e}")
         session.rollback()
     finally:
         session.close()
@@ -1268,23 +1657,33 @@ def run_flask():
     flask_app.run(host="0.0.0.0", port=10000)
 
 async def set_commands(application: Application):
-    commands = [
+    # Команды, доступные всем участникам
+    public_commands = [
         BotCommand("start", "Запустить бота и начать диалог с Амадеусом"),
         BotCommand("help", "Показать список команд"),
         BotCommand("profile", "Посмотреть свой профиль"),
         BotCommand("anketa", "Создать анкету персонажа (по частям)"),
+        BotCommand("cancel", "Отменить текущее заполнение анкеты"),
         BotCommand("send_anketa", "Отправить собранную анкету на модерацию"),
         BotCommand("anketa_review", "Просмотр анкет на модерацию (для анкетников)"),
-        BotCommand("exit_ai", "Выйти из режима общения с ИИ"),
-        BotCommand("reset_ai", "Сбросить историю диалога с ИИ"),
-        BotCommand("remember", "Попросить бота запомнить факт о тебе"),
-        BotCommand("forget_me", "Стереть все сохранённые о тебе факты"),
         BotCommand("rules", "Показать правила сообщества"),
         BotCommand("lore", "История Омниреальности"),
         BotCommand("feedback", "Отправить отзыв или жалобу"),
     ]
-    await application.bot.set_my_commands(commands)
-    logger.info("Команды бота установлены через set_my_commands")
+    await application.bot.set_my_commands(public_commands, scope=BotCommandScopeDefault())
+
+    # Дополнительные команды — видны только владельцу(-ам) бота
+    owner_commands = public_commands + [
+        BotCommand("addanketnik", "Назначить анкетника"),
+        BotCommand("forcefacts", "Принудительно запустить извлечение фактов ИИ"),
+    ]
+    for dev_id in DEVELOPER_IDS:
+        try:
+            await application.bot.set_my_commands(owner_commands, scope=BotCommandScopeChat(chat_id=dev_id))
+        except TelegramError as e:
+            logger.warning(f"Не удалось установить командное меню владельца для {dev_id}: {e}")
+
+    logger.info("Команды бота установлены через set_my_commands (публичные + владельческие)")
 
 async def post_init(application: Application):
     await set_commands(application)
@@ -1303,17 +1702,12 @@ def main():
     application.add_handler(CommandHandler("anketa", anketa))
     application.add_handler(CommandHandler("send_anketa", send_anketa))
     application.add_handler(CommandHandler("anketa_review", anketa_review))
-    application.add_handler(CommandHandler("warn", warn))
-    application.add_handler(CommandHandler("deletemessages", deletemessages))
     application.add_handler(CommandHandler("cancel", cancel))
     application.add_handler(CommandHandler("rules", rules))
     application.add_handler(CommandHandler("lore", lore))
     application.add_handler(CommandHandler("feedback", feedback))
     application.add_handler(CommandHandler("addanketnik", add_anketnik))
-    application.add_handler(CommandHandler("exit_ai", exit_ai))
-    application.add_handler(CommandHandler("reset_ai", reset_ai))
-    application.add_handler(CommandHandler("remember", remember))
-    application.add_handler(CommandHandler("forget_me", forget_me))
+    application.add_handler(CommandHandler("forcefacts", force_extract_facts))
 
     application.add_handler(CallbackQueryHandler(anketa_callback, pattern="^anketa_"))
 
