@@ -184,10 +184,6 @@ class AnketaRequest(Base):
     created_at = Column(DateTime, default=datetime.datetime.now)
     admin_message_id = Column(BigInteger, nullable=True)
     admin_chat_id = Column(BigInteger, nullable=True)
-    # Полное содержимое анкеты (список частей: текст/фото/видео/документы) в виде JSON.
-    # Нужно, чтобы анкеты на ручной модерации переживали перезапуск бота — не только текст, но и кнопки/медиа.
-    items_json = Column(Text, nullable=True)
-    username = Column(String, nullable=True)
 
     user = relationship("User", back_populates="anketa_requests")
 
@@ -279,6 +275,20 @@ def mark_anketa_submitted(user_id: int):
         session.close()
 
 
+def reset_anketa_cooldown(user_id: int) -> bool:
+    """Обнуляет кулдаун на отправку анкеты для конкретного пользователя (используется админ-командой)."""
+    session = SessionLocal()
+    try:
+        user = session.query(User).filter_by(id=user_id).first()
+        if not user:
+            return False
+        user.last_anketa_at = None
+        session.commit()
+        return True
+    finally:
+        session.close()
+
+
 # ==================== РОЛИ УЧАСТНИКОВ ====================
 def set_user_role(user_id: int, role_name: str, hashtag: Optional[str] = None, username: Optional[str] = None) -> str:
     """
@@ -304,83 +314,6 @@ def set_user_role(user_id: int, role_name: str, hashtag: Optional[str] = None, u
         return role_name
     finally:
         session.close()
-
-
-# ==================== ПЕРСИСТЕНТНОСТЬ АНКЕТ НА РУЧНОЙ МОДЕРАЦИИ ====================
-def save_pending_anketa_to_db(anketa_id: str, user_id: int, username: Optional[str], items: list):
-    """
-    Сохраняет анкету, ушедшую на ручную модерацию, в БД — чтобы она не потерялась,
-    если бот перезапустится, пока анкета висит на проверке.
-    """
-    session = SessionLocal()
-    try:
-        existing = session.query(AnketaRequest).filter_by(id=anketa_id).first()
-        if existing:
-            existing.items_json = json.dumps(items, ensure_ascii=False)
-            existing.username = username
-            existing.status = "pending"
-        else:
-            record = AnketaRequest(
-                id=anketa_id,
-                user_id=user_id,
-                username=username,
-                items_json=json.dumps(items, ensure_ascii=False),
-                status="pending",
-            )
-            session.add(record)
-        session.commit()
-    except Exception as e:
-        logger.error(f"Не удалось сохранить анкету {anketa_id} в БД: {e}")
-        session.rollback()
-    finally:
-        session.close()
-
-
-def delete_anketa_from_db(anketa_id: str):
-    """Убирает анкету из БД после того, как по ней принято решение (или она обработана автоматически)."""
-    session = SessionLocal()
-    try:
-        session.query(AnketaRequest).filter_by(id=anketa_id).delete()
-        session.commit()
-    except Exception as e:
-        logger.error(f"Не удалось удалить анкету {anketa_id} из БД: {e}")
-        session.rollback()
-    finally:
-        session.close()
-
-
-def load_pending_anketas_from_db() -> dict:
-    """
-    При старте бота подтягивает из БД все анкеты, которые остались висеть на ручной
-    модерации после предыдущего запуска (например, из-за перезапуска/падения бота),
-    и возвращает их в формате, совместимом с anketa_store.
-    """
-    restored = {}
-    session = SessionLocal()
-    try:
-        rows = session.query(AnketaRequest).filter_by(status="pending").all()
-        for row in rows:
-            try:
-                items = json.loads(row.items_json) if row.items_json else []
-            except Exception as e:
-                logger.error(f"Не удалось разобрать items_json анкеты {row.id}: {e}")
-                items = []
-            restored[row.id] = {
-                "user_id": row.user_id,
-                "username": row.username,
-                "items": items,
-                "status": "pending",
-                "created_at": row.created_at.isoformat() if row.created_at else datetime.datetime.now().isoformat(),
-                "moderated_by": None,
-                "moderated_at": None,
-            }
-        if restored:
-            logger.info(f"Восстановлено {len(restored)} анкет(ы) из БД после перезапуска.")
-    except Exception as e:
-        logger.error(f"Не удалось загрузить анкеты на модерации из БД: {e}")
-    finally:
-        session.close()
-    return restored
 
 
 # ==================== ПАМЯТЬ О УЧАСТНИКЕ (для нейросетки) ====================
@@ -1172,6 +1105,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         help_text += """
 <b>Только для владельца:</b>
 /addanketnik — назначить анкетника
+/resetcd — обнулить кулдаун на отправку анкеты у участника (доступно и модераторам)
 /forcefacts — принудительно запустить извлечение фактов ИИ
 """
 
@@ -1558,9 +1492,8 @@ async def send_anketa(update: Update, context: ContextTypes.DEFAULT_TYPE):
             pass
         mod_note = "⚠️ Автоматическая проверка анкетологом была недоступна, анкета передана без неё."
 
-    # Сохраняем анкету в БД и дублируем в резервный канал — чтобы она не пропала,
-    # если бот перезапустится, пока висит на ручной проверке.
-    save_pending_anketa_to_db(anketa_id, user.id, user.username or user.first_name, items)
+    # Дублируем анкету в резервный канал — чтобы её содержимое не пропало бесследно,
+    # если бот перезапустится, пока анкета висит на ручной проверке.
     await send_anketa_backup_copy(context, anketa_id, user, items)
 
     # Отправляем модераторам
@@ -1712,9 +1645,8 @@ async def anketa_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # не заставляя его ждать ответа нейронки (у неё есть свои таймауты и фолбэк ниже).
         await query.edit_message_text("✅ Анкета одобрена.")
 
-        # Анкета обработана — сразу чистим её из памяти и из БД, дальше она уже не нужна.
+        # Анкета обработана — сразу чистим её из памяти, дальше она уже не нужна.
         anketa_store.pop(anketa_id, None)
-        delete_anketa_from_db(anketa_id)
 
         _, text_parts_for_comment = _build_anketa_media_group(ank["items"])
         anketa_text_for_comment = "\n\n---\n\n".join(text_parts_for_comment)
@@ -1740,7 +1672,6 @@ async def anketa_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text("❌ Анкета отклонена.")
 
         anketa_store.pop(anketa_id, None)
-        delete_anketa_from_db(anketa_id)
 
         _, text_parts_for_comment = _build_anketa_media_group(ank["items"])
         anketa_text_for_comment = "\n\n---\n\n".join(text_parts_for_comment)
@@ -1786,6 +1717,40 @@ async def add_anketnik(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
     finally:
         session.close()
+
+async def reset_anketa_cd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обнуляет антиспам-кулдаун на отправку анкеты у конкретного пользователя (для админов/модераторов)."""
+    user = update.effective_user
+    if not user or not is_admin(user.id):
+        await update.message.reply_text("⛔ У вас нет прав для этой команды.")
+        return
+
+    if not context.args:
+        await update.message.reply_text("⚠️ Использование: /resetcd @username или /resetcd ID")
+        return
+
+    session = SessionLocal()
+    try:
+        arg = context.args[0].replace("@", "")
+        target = None
+        if arg.isdigit():
+            target = session.query(User).filter_by(id=int(arg)).first()
+        else:
+            target = session.query(User).filter_by(username=arg).first()
+
+        if not target:
+            await update.message.reply_text("❌ Пользователь не найден. Попросите его написать /start боту.")
+            return
+
+        target_id = target.id
+        target_username = target.username
+    finally:
+        session.close()
+
+    reset_anketa_cooldown(target_id)
+    await update.message.reply_text(
+        f"✅ Кулдаун на отправку анкеты у @{target_username or target_id} обнулён."
+    )
 
 async def force_extract_facts(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
@@ -1991,6 +1956,7 @@ async def set_commands(application: Application):
     # Дополнительные команды — видны только владельцу(-ам) бота
     owner_commands = public_commands + [
         BotCommand("addanketnik", "Назначить анкетника"),
+        BotCommand("resetcd", "Обнулить кулдаун на отправку анкеты у участника"),
         BotCommand("forcefacts", "Принудительно запустить извлечение фактов ИИ"),
     ]
     for dev_id in DEVELOPER_IDS:
@@ -2003,13 +1969,6 @@ async def set_commands(application: Application):
 
 async def post_init(application: Application):
     await set_commands(application)
-
-    # Восстанавливаем анкеты, которые остались на ручной модерации после предыдущего запуска,
-    # чтобы они не пропадали при перезапуске бота.
-    restored = load_pending_anketas_from_db()
-    if restored:
-        anketa_store.update(restored)
-
     asyncio.create_task(cleanup_inactive_users_loop())
     logger.info(f"Запущена фоновая очистка неактивных пользователей (порог: {INACTIVE_DAYS_THRESHOLD} дней).")
 
@@ -2031,6 +1990,7 @@ def main():
     application.add_handler(CommandHandler("lore", lore))
     application.add_handler(CommandHandler("feedback", feedback))
     application.add_handler(CommandHandler("addanketnik", add_anketnik))
+    application.add_handler(CommandHandler("resetcd", reset_anketa_cd))
     application.add_handler(CommandHandler("forcefacts", force_extract_facts))
 
     application.add_handler(CallbackQueryHandler(anketa_callback, pattern="^anketa_"))
