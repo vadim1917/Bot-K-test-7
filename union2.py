@@ -121,9 +121,6 @@ class User(Base):
     facts = Column(StringList, default=[])
     last_seen = Column(DateTime, nullable=True)
 
-    # Когда пользователь последний раз ОТПРАВЛЯЛ анкету на модерацию (антиспам-кулдаун).
-    last_anketa_at = Column(DateTime, nullable=True)
-
     roles = relationship("Role", back_populates="user", cascade="all, delete-orphan")
     support_requests = relationship("SupportRequest", back_populates="user", cascade="all, delete-orphan")
     posts = relationship("Post", back_populates="user", cascade="all, delete-orphan")
@@ -244,49 +241,35 @@ def touch_user(user_id: int):
 
 
 # ==================== АНТИСПАМ: КУЛДАУН НА ОТПРАВКУ АНКЕТЫ ====================
+# Хранится в памяти процесса (не в БД) — бот работает 24/7, а после случайного рестарта
+# лишний сброс кулдауна не критичен, зато не плодим лишние обращения к БД на каждую анкету.
+anketa_cooldowns: dict[int, datetime.datetime] = {}
+
+
 def get_anketa_cooldown_remaining(user_id: int) -> Optional[datetime.timedelta]:
     """
     Возвращает оставшееся время кулдауна, если пользователь отправлял анкету
     менее ANKETA_COOLDOWN_MINUTES минут назад, иначе None (можно отправлять).
-    Хранится в БД (а не в памяти процесса), чтобы кулдаун переживал перезапуск бота.
     """
-    session = SessionLocal()
-    try:
-        user = session.query(User).filter_by(id=user_id).first()
-        if not user or not user.last_anketa_at:
-            return None
-        elapsed = datetime.datetime.now() - user.last_anketa_at
-        remaining = datetime.timedelta(minutes=ANKETA_COOLDOWN_MINUTES) - elapsed
-        if remaining.total_seconds() > 0:
-            return remaining
+    last_sent = anketa_cooldowns.get(user_id)
+    if not last_sent:
         return None
-    finally:
-        session.close()
+    elapsed = datetime.datetime.now() - last_sent
+    remaining = datetime.timedelta(minutes=ANKETA_COOLDOWN_MINUTES) - elapsed
+    if remaining.total_seconds() > 0:
+        return remaining
+    return None
 
 
 def mark_anketa_submitted(user_id: int):
     """Фиксирует момент отправки анкеты — от него отсчитывается кулдаун."""
-    session = SessionLocal()
-    try:
-        user, _ = get_or_create_user(session, user_id)
-        user.last_anketa_at = datetime.datetime.now()
-        session.commit()
-    finally:
-        session.close()
+    anketa_cooldowns[user_id] = datetime.datetime.now()
 
 
 def reset_anketa_cooldown(user_id: int) -> bool:
     """Обнуляет кулдаун на отправку анкеты для конкретного пользователя (используется админ-командой)."""
-    session = SessionLocal()
-    try:
-        user = session.query(User).filter_by(id=user_id).first()
-        if not user:
-            return False
-        user.last_anketa_at = None
-        session.commit()
-        return True
-    finally:
-        session.close()
+    anketa_cooldowns.pop(user_id, None)
+    return True
 
 
 # ==================== РОЛИ УЧАСТНИКОВ ====================
