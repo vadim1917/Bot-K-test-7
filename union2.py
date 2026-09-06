@@ -908,69 +908,6 @@ def with_recovery_flavor(command_name: str):
         return wrapper
     return decorator
 
-def with_command_loading(command_name: str):
-    """
-    Декоратор: перед выполнением команды коротко показывает анимацию загрузки
-    в стиле терминала, затем удаляет её и выполняет саму команду как обычно.
-    Пропускается, если у пользователя сейчас идёт период "восстановления" после
-    Зума — там уже есть своя (более длинная) сбойная анимация, дублировать не нужно.
-    """
-    def decorator(func):
-        @functools.wraps(func)
-        async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE, *args, **kwargs):
-            user = update.effective_user
-            if user and update.message and user_post_zoom_recovery.get(user.id, 0) <= 0:
-                loading_msg = await update.message.reply_text("> Loading")
-                for dots in (".", "..", "..."):
-                    await asyncio.sleep(0.25)
-                    try:
-                        await loading_msg.edit_text(f"> Loading{dots}")
-                    except Exception:
-                        pass
-                try:
-                    await loading_msg.delete()
-                except Exception:
-                    pass
-            return await func(update, context, *args, **kwargs)
-        return wrapper
-    return decorator
-
-async def send_terminal_typed(message: Message, text: str, parse_mode: Optional[str] = None, words_per_step: int = 3, delay: float = 0.05):
-    """
-    Отправляет текст, "печатая" его порциями слов (эффект вывода в терминале),
-    затем заменяет финальным полным текстом (с HTML-разметкой, если она передана).
-    Во время печати теги разметки скрыты, чтобы не мелькали недорисованные <b> и т.п.
-    """
-    plain_text = re.sub(r'<[^>]+>', '', text) if parse_mode else text
-    words = plain_text.split(" ")
-    if not words or not words[0]:
-        await message.reply_text(text, parse_mode=parse_mode)
-        return
-
-    max_steps = 40  # ограничение, чтобы очень длинный текст не печатался слишком долго
-    step = max(words_per_step, len(words) // max_steps + 1)
-
-    msg = None
-    built = ""
-    for i in range(0, len(words), step):
-        chunk = " ".join(words[i:i + step])
-        built = (built + " " + chunk).strip() if built else chunk
-        if msg is None:
-            msg = await message.reply_text(built)
-        else:
-            try:
-                await msg.edit_text(built)
-            except Exception:
-                pass
-        await asyncio.sleep(delay)
-
-    if msg is None:
-        await message.reply_text(text, parse_mode=parse_mode)
-        return
-    try:
-        await msg.edit_text(text, parse_mode=parse_mode)
-    except Exception:
-        pass
 
 async def generate_ban_comment(user_id: int):
     """Фоновая задача: генерирует комментарий Амадеуса для бана и сохраняет в словарь."""
@@ -2019,7 +1956,6 @@ def notify_on_repeat(command_name: str):
 
 # ---------- /start (с персонализацией) ----------
 @zoom_override("start", block=True)
-@with_command_loading("start")
 @with_recovery_flavor("start")
 @notify_on_repeat("start")
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2058,7 +1994,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ---------- /help (HTML) ----------
 @zoom_override("help")
-@with_command_loading("help")
 @with_recovery_flavor("help")
 @notify_on_repeat("help")
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2093,11 +2028,10 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     help_text += "\nЕсли и этого недостаточно — обратись к администрации, я не справочная служба.\n"
 
-    await send_terminal_typed(update.message, help_text, parse_mode='HTML')
+    await update.message.reply_text(help_text, parse_mode='HTML')
 
 # ---------- /profile ----------
 @zoom_override("profile")
-@with_command_loading("profile")
 @with_recovery_flavor("profile")
 @notify_on_repeat("profile")
 async def profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2131,7 +2065,6 @@ Username: @{user.username or 'не указан'}
 
 # ---------- /setrole ----------
 @zoom_override("setrole")
-@with_command_loading("setrole")
 @with_recovery_flavor("setrole")
 async def setrole(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Позволяет участнику самостоятельно указать роль (имя персонажа). Роль всегда одна — новая заменяет старую."""
@@ -2168,32 +2101,27 @@ async def setrole(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ---------- /rules ----------
 @zoom_override("rules")
-@with_command_loading("rules")
 @with_recovery_flavor("rules")
 @notify_on_repeat("rules")
 async def rules(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await send_terminal_typed(
-        update.message,
+    await update.message.reply_text(
         "Вот правила сообщества. Ознакомься, прежде чем действовать необдуманно:\n"
         "https://telegra.ph/Konstituciya-Omniversa-05-15"
     )
 
 # ---------- /lore ----------
 @zoom_override("lore")
-@with_command_loading("lore")
 @with_recovery_flavor("lore")
 @notify_on_repeat("lore")
+@with_recovery_flavor("rules")
 async def lore(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = "Если тебе интересна история — вот события Омниреальности."
-    await send_terminal_typed(update.message, text)
-
     keyboard = [[InlineKeyboardButton("Война Дума", url="https://telegra.ph/Vojna-Duma-07-27")]]
     reply_markup = InlineKeyboardMarkup(keyboard)
-    await update.message.reply_text("👇", reply_markup=reply_markup)
+    await update.message.reply_text(text, parse_mode='HTML', reply_markup=reply_markup)
 
 # ---------- /feedback ----------
 @zoom_override("feedback")
-@with_command_loading("feedback")
 @with_recovery_flavor("feedback")
 async def feedback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
@@ -2219,7 +2147,6 @@ async def feedback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ---------- /cancel ----------
 @zoom_override("cancel")
-@with_command_loading("cancel")
 @with_recovery_flavor("cancel")
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear()
@@ -2231,7 +2158,6 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 anketa_store = {}
 
 @zoom_override("anketa")
-@with_command_loading("anketa")
 @with_recovery_flavor("anketa")
 @notify_on_repeat("anketa")
 async def anketa(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2391,7 +2317,6 @@ async def send_anketa_backup_copy(context: ContextTypes.DEFAULT_TYPE, anketa_id:
         logger.error(f"Не удалось отправить резервную копию анкеты {anketa_id} в BACKUP_ANKET_CHANNEL_ID: {e}")
 
 @zoom_override("send_anketa")
-@with_command_loading("send_anketa")
 @with_recovery_flavor("send_anketa")
 async def send_anketa(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
@@ -2550,7 +2475,6 @@ async def send_anketa(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.pop('anketa_items', None)
 
 @zoom_override("anketa_review")
-@with_command_loading("anketa_review")
 @with_recovery_flavor("anketa_review")
 async def anketa_review(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
