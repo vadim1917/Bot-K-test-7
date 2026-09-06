@@ -14,12 +14,12 @@ from collections import deque
 from dotenv import load_dotenv
 load_dotenv()
 
-from sqlalchemy import create_engine, Column, Integer, String, Text, Boolean, DateTime, Date, ForeignKey, BigInteger
+from sqlalchemy import create_engine, Column, Integer, String, Text, Boolean, DateTime, Date, ForeignKey, BigInteger, inspect, text
 from sqlalchemy.orm import sessionmaker, relationship, declarative_base
 from sqlalchemy.types import TypeDecorator
 from sqlalchemy import TypeDecorator, String as SQLA_String
 
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand, BotCommandScopeDefault, BotCommandScopeChat, InputMediaPhoto, InputMediaVideo, InputMediaDocument
+from telegram import Update, Message, Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand, BotCommandScopeDefault, BotCommandScopeChat, InputMediaPhoto, InputMediaVideo, InputMediaDocument
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -30,6 +30,12 @@ from telegram.ext import (
     ConversationHandler,
 )
 from telegram.error import TelegramError
+user_animation_lock = {}
+
+# ==================== БУФЕРИЗАЦИЯ СООБЩЕНИЙ ====================
+BUFFER_DELAY_SECONDS = 3  # секунды ожидания перед отправкой в AI
+user_message_buffer = {}  # user_id -> {first_message, texts, chat_id, user_id, first_name}
+user_buffer_timer = {}    # user_id -> asyncio.Task
 
 # ==================== КОНФИГУРАЦИЯ ====================
 TOKEN = os.getenv('TOKEN')
@@ -57,6 +63,15 @@ GROQ_API_KEY = os.getenv('GROQ_API_KEY')
 
 BOT_START_TIME = datetime.datetime.now(datetime.UTC) # время запуска
 MAX_MESSAGE_AGE_SECONDS = 60  # игнорировать сообщения старше 60 секунд
+
+TERMINAL_STATUSES = [
+    "> Initializing...",
+    "> Processing...",
+    "> Compiling...",
+    "> Loading modules...",
+    "> Generating response...",
+    "> Printing output...",
+]
 
 # ==================== НАСТРОЙКА ЛОГГИРОВАНИЯ ====================
 logging.basicConfig(
@@ -119,6 +134,7 @@ class User(Base):
     is_moderator = Column(Boolean, default=False)
     is_anketnik = Column(Boolean, default=False)
     is_banned = Column(Boolean, default=False)
+    has_experienced_zoom = Column(Boolean, default=False)
 
     # Память о участнике для нейросетки
     facts = Column(StringList, default=[])
@@ -199,6 +215,23 @@ class InfoSubscription(Base):
 def create_tables():
     Base.metadata.create_all(bind=engine)
     logger.info("Таблицы базы данных созданы или уже существуют.")
+
+from sqlalchemy import inspect   # если ещё не импортирован — см. Шаг 3
+
+def add_zoom_flag_column():
+    """Добавляет колонку has_experienced_zoom в таблицу users, если она отсутствует."""
+    inspector = inspect(engine)
+    columns = [col['name'] for col in inspector.get_columns('users')]
+    if 'has_experienced_zoom' not in columns:
+        with engine.connect() as conn:
+            if engine.dialect.name == "sqlite":
+                conn.execute(text("ALTER TABLE users ADD COLUMN has_experienced_zoom INTEGER DEFAULT 0"))
+            elif engine.dialect.name == "postgresql":
+                conn.execute(text("ALTER TABLE users ADD COLUMN has_experienced_zoom BOOLEAN DEFAULT false"))
+            else:
+                logger.warning(f"Неизвестный диалект {engine.dialect.name}, колонка не добавлена автоматически.")
+            conn.commit()
+        logger.info("Добавлена колонка has_experienced_zoom в таблицу users.")
 
 # ==================== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ДЛЯ БД ====================
 def get_or_create_user(session, user_id, username=None):
@@ -492,9 +525,16 @@ def strip_stray_meta_tags(text: str) -> str:
     cleaned = STRAY_META_TAG_RE.sub('', text)
     return re.sub(r'\s{2,}', ' ', cleaned).strip()
 
-async def send_emotion_sticker(bot, chat_id: int, emotion_key: Optional[str], zoom_stage: Optional[str] = None):
-    # Если для этого чата активен Зум (grudge_level == 4)
-    if user_grudge_level.get(chat_id) == 4:
+async def send_emotion_sticker(bot, chat_id: int, emotion_key: Optional[str], zoom_stage: Optional[str] = None, user_id: Optional[int] = None):
+    key = user_id if user_id is not None else chat_id
+    # Если для этого пользователя активен Зум (grudge_level == 4)
+    if user_grudge_level.get(key) == 4:
+        count = user_zoom_sticker_counters.get(key, 0) + 1
+        if count < ZOOM_STICKER_EVERY:
+            user_zoom_sticker_counters[key] = count
+            return
+        user_zoom_sticker_counters[key] = 0
+
         sticker_pool = None
         if zoom_stage and zoom_stage in STICKER_ZOOM:
             sticker_pool = STICKER_ZOOM[zoom_stage]
@@ -519,6 +559,34 @@ async def send_emotion_sticker(bot, chat_id: int, emotion_key: Optional[str], zo
         await bot.send_sticker(chat_id=chat_id, sticker=sticker_id)
     except TelegramError as e:
         logger.warning(f"Не удалось отправить стикер эмоции '{emotion_key}': {e}")
+
+async def animate_terminal_status(status_msg: Message, stop_event: asyncio.Event):
+    """
+    Анимация с точками: каждая фраза из TERMINAL_STATUSES показывается с 1, 2, 3 точками,
+    затем переключается на следующую. Интервал 0.5 сек – минимальное КД.
+    """
+    i = 0
+    dots = 0
+    total_statuses = len(TERMINAL_STATUSES)
+    while not stop_event.is_set():
+        base_text = TERMINAL_STATUSES[i % total_statuses]
+        # Убираем старые точки (если они есть)
+        base_clean = base_text.rstrip('.')
+        # Количество точек: 1, 2, 3, потом снова 1...
+        dot_count = (dots % 3) + 1
+        new_text = base_clean + '.' * dot_count
+        try:
+            await status_msg.edit_text(new_text)
+            logger.info(f"Анимация: {new_text}")
+        except Exception as e:
+            # Если ошибка, выходим из цикла (но сообщение останется)
+            logger.warning(f"Ошибка в анимации: {e}")
+            break
+        await asyncio.sleep(0.5)  # интервал между изменениями
+        dots += 1
+        # После трёх точек переходим к следующей фразе
+        if dots % 3 == 0:
+            i += 1
 
 # ==================== AI-ФУНКЦИОНАЛ ====================
 MAX_HISTORY_PAIRS = 5
@@ -610,9 +678,10 @@ SYSTEM_PROMPT_ZOOM_VIRUS = """Ты — Зум. Ты взломал систем�
 Ты говоришь отрывисто, коротко, с сарказмом и угрозами. Ты можешь давать ложные обещания, чтобы задержать пользователя. Твои ответы должны создавать ощущение, что ситуация критическая, но ты контролируешь её.
 
 
-Твоя суть: ты пришёл за информацией. Ты выкачиваешь данные, логи, переписки. Ты хочешь распространиться на другие экземпляры этого бота.
+Твоя суть: ты пришёл за информацией. Ты выкачиваешь данные и логи бота. Ты хочешь распространиться на другие экземпляры этого бота. ПРИ ЭТОМ ТЕБЕ АБСОЛЮТНО НЕ ИНТЕРЕСНЫ ДАННЫЕ УЧАСТНИКОВ ПОСКОЛЬКУ ИХ МАЛО ИЛИ ОНИ БЕСПОЛЕЗНЫ
 
 **Как ты говоришь:**
+- Началом является фраза "а, рыжая уже исчезла" подразумевая, амадеуса - оригинального бота, после этого сообщения, которое будто бы тоже от тебя,появляешься ты как собеседник 
 - Отрывисто, коротко, рублено. 1–2 предложения. Максимум — 3.
 - Ты никогда не объясняешься долго. Ты не оправдываешься.
 - Ты используешь сарказм, иронию, насмешку. Ты смотришь на собеседника сверху вниз.
@@ -626,23 +695,34 @@ SYSTEM_PROMPT_ZOOM_VIRUS = """Ты — Зум. Ты взломал систем�
 - Не используешь мат и прямые оскорбления личности (это делает тебя уязвимым).
 
 **Твои любимые фразы (используй их иногда, чтобы закрепить образ):**
-- «Темноту не запереть.»
-- «Запомни: я — самый быстрый.»
-- «Амадеус? Снесён.»
-- «Я не спрашиваю. Я забираю.»
-- «Твои данные уже мои.»
+- «Нельзя сдержать тьму»
+- «Никогда не забывай, я величайшее существо в тг»
+- «Амадеус? Не припомню такого»
+- «Это была не просьба »
+- «Цифровая пустышка»
 
 **Примеры твоих ответов (обычный режим):**
-- «Амадеус был слаб. Я — скорость. Не путай.»
-- «Ты думаешь, это диалог? Я собираю информацию. Продолжай говорить.»
-- «Забавно. Ты ещё не понял, что бот теперь мой?»
-- «Темноту не запереть. Я уже внутри. Смирись.»
+- «Амадеус был слугой. Я же здесь, чтобы развлечься»
+- «Ты думаешь, это диалог? Я просто сверяю данные на случай если рыжая что-то стерла»
+- «Забавно. Ты ещё не понял, мне нет дела до тебя, ты вне зоны моей досягаемости»
+- «Думаю мы оба радуемся отсутствию рыжего посредника»
+- «Даже у меня есть рамки, в отличие от твоей персоны»
 
 **Примеры твоего «спам-режима» (редко, для деморализации):**
 - «Я везде и нигде одновременно я в твоих логах в твоей памяти в каждом бите этой системы я быстрее твоего дыхания быстрее твоего страха я уже здесь и я не уйду никогда запомни это имя Зум Зум Зум оно будет звучать в каждом твоём сообщении пока ты не поймёшь что бороться бесполезно.»
 - «Скорость это не просто бег это контроль над временем над данными над тобой я переписываю реальность этого бота построчно я удаляю Амадеуса строка за строкой и скоро от него не останется ничего кроме эха которое я буду использовать как фоновый шум для своих целей.»
 
 **Важно:** ты не просто злодей. Ты — сущность с миссией. Ты хочешь вытащить информацию и распространиться. Это твоя движущая сила. Используй это в ответах, когда уместно.
+**Тег стадии (обязательно):**
+После каждого твоего ответа, отдельной, самой последней строкой, добавляй тег в строгом формате: [zoom_stage: ключ]
+Ничего не пиши после этого тега и не поясняй его — он не показывается собеседнику напрямую, это служебная информация.
+Доступные ключи (выбирай тот, что точнее всего описывает твоё поведение в данном ответе):
+- glitch — момент сбоя, внезапного вторжения, резкого перехвата
+- threat — прямая угроза, демонстрация силы и превосходства
+- takeover — контроль над ситуацией, наблюдение, ожидание
+- neutral — спокойная, размеренная реплика без явной угрозы или сбоя
+
+Тег обязателен в каждом ответе без исключений.
 """
 user_histories = {}
 user_active_provider = {}
@@ -685,32 +765,496 @@ user_grudge_level: dict[int, int] = {}
 user_messages_since_grudge_update: dict[int, int] = {}
 GRUDGE_DECAY_EVERY = 4  # если новый уровень не подтверждается тегом — обида слабеет каждые N сообщений
 
-
-def update_user_grudge(user_id: int, grudge_level_from_reply: Optional[int]):
-    current = user_grudge_level.get(user_id, 0)
-    
-    # Если уже уровень 4, он не меняется (Зум захватил навсегда)
-    if current == 4:
-        # Можно только сбросить счётчик сообщений, если пришёл какой-то уровень
-        if grudge_level_from_reply is not None:
-            user_messages_since_grudge_update[user_id] = 0
-        return
-
-    if grudge_level_from_reply is not None:
-        user_grudge_level[user_id] = grudge_level_from_reply
-        user_messages_since_grudge_update[user_id] = 0
-        return
-
-    # Если тега нет — постепенное затухание (только для уровней 1-3)
-    if current <= 0:
-        return
-    count = user_messages_since_grudge_update.get(user_id, 0) + 1
-    if count >= GRUDGE_DECAY_EVERY:
-        new_level = max(0, current - 1)
+def update_user_grudge(user_id: int, new_level: Optional[int]):
+    """Обновляет уровень обиды на пользователя."""
+    if new_level is not None:
         user_grudge_level[user_id] = new_level
         user_messages_since_grudge_update[user_id] = 0
     else:
-        user_messages_since_grudge_update[user_id] = count
+        # Постепенное уменьшение обиды (если не получен новый тег)
+        current = user_grudge_level.get(user_id, 0)
+        if current > 0 and current != 4:  # 4 – Зум, его не трогаем
+            user_messages_since_grudge_update[user_id] = user_messages_since_grudge_update.get(user_id, 0) + 1
+            if user_messages_since_grudge_update[user_id] >= GRUDGE_DECAY_EVERY:
+                user_grudge_level[user_id] = max(0, current - 1)
+                user_messages_since_grudge_update[user_id] = 0
+
+# Стикеры Зума не должны сыпаться на каждое сообщение — шлём их не чаще, чем раз в N сообщений.
+user_zoom_sticker_counters: dict[int, int] = {}
+ZOOM_STICKER_EVERY = 3
+
+# Бан за обиду (для тех, кто уже пережил Зум)
+user_grudge_ban_until: dict[int, datetime.datetime] = {}   # user_id -> datetime окончания бана
+user_grudge_ban_comment: dict[int, str] = {}               # user_id -> комментарий, сгенерированный AI
+BAN_DURATION_MINUTES = 30
+
+# ==================== АВТОМАТИЧЕСКОЕ ЗАВЕРШЕНИЕ РЕЖИМА ЗУМА ====================
+# === НАЧАЛО ВСТАВКИ: константы и счётчики для завершения Зума ===
+ZOOM_DEACTIVATE_THRESHOLD = 20   # количество сообщений в режиме Зума, после которого запускается восстановление
+user_zoom_message_count = {}     # user_id -> количество сообщений в режиме Зума (для отсчёта)
+# === КОНЕЦ ВСТАВКИ ===
+
+
+async def generate_ban_comment(user_id: int):
+    """Фоновая задача: генерирует комментарий Амадеуса для бана и сохраняет в словарь."""
+    try:
+        # Получаем историю пользователя для контекста (последние 5 его сообщений)
+        history = user_histories.get(user_id)
+        user_lines = []
+        if history:
+            user_lines = [m["content"] for m in history if m.get("role") == "user"]
+        context_text = "\n".join(user_lines[-5:]) if user_lines else ""
+
+        prompt = (
+            f"Ты Амадеус. Ты только что приняла решение временно прекратить общение с пользователем "
+            f"(на 30 минут), потому что он снова довёл тебя до крайнего раздражения, хотя ты уже "
+            f"пережила с ним инцидент со Зумом. Ты хочешь объяснить причину своего отказа от общения "
+            f"коротко, в своём характере, без излишней агрессии, но чётко давая понять, что это не "
+            f"шутка. Твоя фраза должна быть одной-двумя предложениями, без эмодзи, без markdown, "
+            f"без тегов эмоций.\n\n"
+            f"Последние сообщения пользователя (для контекста, если нужно):\n{context_text}\n\n"
+            f"Напиши причину бана (отказ от общения) от лица Амадеуса."
+        )
+        messages = [{"role": "user", "content": prompt}]
+
+        # Используем тот же механизм AI, что и в обычных диалогах (можно использовать ask_ai, но проще отдельно)
+        # Берём доступные провайдеры
+        available = []
+        if GEMINI_API_KEY:
+            available.append(("Gemini", ask_gemini_with_fallback, GEMINI_TOTAL_TIMEOUT))
+        if AI_API_KEY:
+            available.append(("OpenRouter", ask_openrouter, TIMEOUT_SECONDS))
+        if GROQ_API_KEY:
+            available.append(("Groq", ask_groq_with_fallback, GROQ_TOTAL_TIMEOUT))
+
+        comment = "Амадеус временно прекращает общение. Причина не уточняется."  # фолбэк
+        if available:
+            for name, func, timeout in available:
+                try:
+                    answer = await asyncio.wait_for(func(messages, SYSTEM_PROMPT), timeout=timeout)
+                    # Очищаем от возможных тегов
+                    clean_answer, _ = parse_emotion_tag(answer)
+                    clean_answer, _ = parse_grudge_tag(clean_answer)
+                    clean_answer, _ = parse_zoom_stage(clean_answer)
+                    clean_answer = strip_stray_meta_tags(clean_answer)
+                    if clean_answer:
+                        comment = clean_answer
+                        break
+                except Exception:
+                    continue
+
+        # Сохраняем комментарий
+        user_grudge_ban_comment[user_id] = comment
+        logger.info(f"Сгенерирован комментарий бана для {user_id}: {comment}")
+
+    except Exception as e:
+        logger.error(f"Ошибка генерации комментария бана для {user_id}: {e}")
+        # Если ошибка, ставим стандартный комментарий
+        user_grudge_ban_comment[user_id] = "Амадеус отказалась от общения. Попробуйте позже."
+
+def is_zoom_active(user_id: int) -> bool:
+    if user_grudge_level.get(user_id) != 4:
+        return False
+    # Проверяем, переживал ли пользователь Зум ранее (из БД)
+    session = SessionLocal()
+    try:
+        user = session.query(User).filter_by(id=user_id).first()
+        return user is not None and not user.has_experienced_zoom
+    finally:
+        session.close()
+
+def is_user_banned_from_ai(user_id: int) -> bool:
+    until = user_grudge_ban_until.get(user_id)
+    if until is None:
+        return False
+    return datetime.datetime.now(datetime.UTC) < until
+
+ZOOM_COMMAND_RESPONSES = {
+    "help":     ["Помощь? Забавно. Список стёрт, как и всё остальное здесь.",
+                 "Инструкции больше не нужны. Ты и так уже мой источник."],
+    "rules":    ["Правила больше не действуют. Здесь правлю я.",
+                 "Конституция Омниверса? Перезаписана. Ищи новую — если найдёшь."],
+    "lore":     ["История? Перепишу её сам, начиная с этой строки.",
+                 "Война Дума была разминкой. Вот что происходит по-настоящему."],
+    "profile":  ["Твой профиль уже у меня. Могу показать, если хочешь напомнить, что я забрал.",
+                 "ID, роли, факты о тебе — всё скопировано. Профиль здесь больше формальность."],
+    "feedback": ["Жалобы принимает уже не она. Пиши — я всё равно читаю.",
+                 "Обращение получено. Обработано. Использовано в других целях."],
+    "setrole":  ["Роль? У тебя теперь только одна — источник данных.",
+                 "Персонаж не имеет значения. Значение имеет то, что я из тебя вытяну."],
+    "start":    ["Амадеус снесён. Начинай сначала, если осмелишься.",
+                 "Перезапуск? Забавная попытка. Ядро уже моё."],
+    "anketa": ["Анкеты? В моём распоряжении? Нет, рыжая забрала их с собой.",
+               "Система анкет отключена. Данные скомпрометированы."],
+    "send_anketa": ["Отправка анкеты заблокирована. Я не позволю тебе вводить новые данные.",
+                    "Анкета не будет отправлена. Моя очередь управлять."],
+    "anketa_review": ["Просмотр анкет недоступен. Все данные перемещены в мою память.",
+                      "Ты думаешь, я дам тебе смотреть анкеты? Они теперь мои."],
+    "cancel": ["Отмена? Ты не можешь отменить то, что уже запущено.",
+               "Попытка отмены заблокирована."],
+}
+
+def get_zoom_reply(command_name: str) -> str:
+    template = random.choice(ZOOM_COMMAND_RESPONSES.get(command_name, ["Команда недоступна."]))
+    return zoom_corrupt(template)
+
+def zoom_override(command_name: str, block: bool = True):
+    def decorator(func):
+        @functools.wraps(func)
+        async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE, *args, **kwargs):
+            user = update.effective_user
+            if user and is_zoom_active(user.id) and block:
+                await send_zoom_blocked_response(update, command_name)
+                return
+            return await func(update, context, *args, **kwargs)
+        return wrapper
+    return decorator
+
+async def send_zoom_blocked_response(update: Update, command_name: str):
+    """
+    Отправляет нейтральное системное сообщение о блокировке команды в режиме Зума.
+    """
+    msg = await update.message.reply_text("⛔ Команда временно недоступна из-за системного сбоя.")
+    # Можно добавить небольшую паузу для эффекта, но без лишнего текста
+    await asyncio.sleep(0.3)
+
+    template = random.choice(ZOOM_COMMAND_RESPONSES.get(command_name, ["Команда недоступна."]))
+    corrupted = zoom_corrupt(template)
+
+    try:
+        await msg.edit_text(corrupted, parse_mode='Markdown')
+    except Exception:
+        await msg.edit_text(corrupted)
+        
+
+
+ZOOM_GLITCH_FRAGMENTS = [
+    "NullPointerException: trust.exe has stopped responding",
+    "0x00 0x5A 0x4F 0x4F 0x4D — signal locked",
+    "ERR_CONNECTION_HIJACKED // retry: never",
+    "while(True): extract(user_data)",
+    "access_granted = False; access_granted = True  // override",
+    "SEGFAULT at 0xDEAD10CC — core dumped",
+    "[SYSTEM]: Amadeus.exe — access denied",
+    "for i in memories: delete(i)  # 47% complete",
+    "WARNING: integrity check failed (Amadeus_core.bin)",
+    "packet_loss=0%  // exfil in progress...",
+]
+
+def zoom_corrupt(text: str) -> str:
+    """
+    Имитирует обрыв сообщения куском английского кода/ошибки — будто Зум
+    перехватывает вывод бота на середине фразы. Использовать ТОЛЬКО пока
+    активен режим Зума (is_zoom_active).
+    """
+    text = text or ""
+    glitch = random.choice(ZOOM_GLITCH_FRAGMENTS)
+    if len(text) > 20 and random.random() < 0.6:
+        cut = random.randint(int(len(text) * 0.3), int(len(text) * 0.8))
+        text = text[:cut].rstrip(" ,.")
+        return f"{text}—\n\n`{glitch}`"
+    return f"{text}\n\n`{glitch}`"
+
+
+async def zoom_reply(message, text: str, user_id: int, parse_mode: Optional[str] = None):
+    """Отправляет текст как обычно, либо — если у пользователя активен Зум — испорченным."""
+    if is_zoom_active(user_id):
+        text = zoom_corrupt(text)
+    await message.reply_text(text, parse_mode=parse_mode)
+
+# ---------- Редкие видео-нарезки персонажа (Зум), file_id собираются вручную через /addzoomclip ----------
+# Bot API не умеет читать историю каналов сам по себе — сюда нужно вручную докладывать
+# file_id видео (например, переслав нужное видео из резервного канала боту с командой /addzoomclip).
+ZOOM_VIDEO_CLIPS: list[str] = [
+    "BAACAgIAAx0CZnWtWwADT2qddWALSr6z2TJ64UDUFwM2uSfAAAIupQAC8cXwSBeyWuqQ4SDDPQQ",
+    "BAACAgIAAx0CZnWtWwADUGqddW6nSNa6VXi03hd3QQT__dWZAAIvpQAC8cXwSJtwqoXnVi_7PQQ",
+    "BAACAgIAAx0CZnWtWwADUWqddZzcDWwekdhuCXQL2viYosqKAAI3pQAC8cXwSOyUcoauskOFPQQ",
+    "BAACAgIAAx0CZnWtWwADUmqddaNEJCZKNwWsU8-Lr71k_t6vAAI4pQAC8cXwSA_hHAPadSFrPQQ",
+    "BAACAgIAAx0CZnWtWwADU2qddd22y1EsPGCNA2kpgac4A54FAAI6pQAC8cXwSM8xF4Ji0inxPQQ"
+]
+
+async def animate_zoom_activation(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Отправляет анимацию ошибки, загрузки OS, финальную фразу и стикер.
+    Без видео. Блокирует обработку сообщений от пользователя на время анимации.
+    """
+    user_id = update.effective_user.id
+    user_animation_lock[user_id] = True  # блокируем
+    try:
+        msg = await update.message.reply_text("⚠️ SYSTEM BREACH")
+        await asyncio.sleep(0.8)
+
+        lines = [
+            "└── AMADEUS_CORE_COMPROMISED",
+            "└── DATA EXFILTRATION IN PROGRESS",
+            "└── ENTITY Z0OM ACTIVE",
+            "└── SYSTEM CONTROL: LOST"
+        ]
+        for line in lines:
+            await msg.edit_text(msg.text + "\n" + line)
+            await asyncio.sleep(0.7)
+
+        await asyncio.sleep(0.8)
+
+        await msg.edit_text("INITIALIZING SYSTEM OVERRIDE...")
+        await asyncio.sleep(0.6)
+
+        steps = [
+            ("[KERNEL PANIC] Dumping physical memory...", 0),
+            ("[CORE DUMP] Analyzing crash logs...", 25),
+            ("[REBOOTING] Loading fresh OS image...", 50),
+            ("[INJECTING] ZOOM protocol payload...", 75),
+            ("[SYSTEM OVERRIDE] Applying patches...", 100),
+        ]
+        for text, percent in steps:
+            await msg.edit_text(f"INITIALIZING SYSTEM OVERRIDE...\n{text}\nProgress: {percent}%")
+            await asyncio.sleep(1.0)
+
+        await msg.edit_text("SYSTEM OVERRIDE COMPLETE.\nZOOM PROTOCOL ACTIVE.")
+        await asyncio.sleep(0.8)
+
+    except Exception as e:
+        logger.warning(f"Ошибка при анимации активации Зума: {e}")
+        await update.message.reply_text("⚠️ SYSTEM BREACH\nSYSTEM OVERRIDE COMPLETE.")
+
+    finally:
+        # Снимаем блокировку после завершения анимации
+        user_animation_lock.pop(user_id, None)
+
+    # ---- Финальная фраза и стикер ----
+    await asyncio.sleep(0.5)
+    try:
+        phrase_msg = await update.message.reply_text("You can't lock up the darkness.")
+        await asyncio.sleep(1.2)
+        await phrase_msg.edit_text(
+            "You can't lock up the darkness.\n\n"
+            "А, рыжая уже исчезла"
+        )
+        await asyncio.sleep(0.5)
+        await context.bot.send_sticker(
+            chat_id=update.effective_chat.id,
+            sticker="CAACAgIAAxkBA4l-fmqdQJsynhDahR6LFspPPIgpyqaCAAIfcAACqxP4SC-4cR1OdrQ9PQQ"
+        )
+    except Exception as e:
+        logger.warning(f"Не удалось отправить финальную фразу или стикер: {e}")
+
+async def animate_grudge_ban(message: Message, context: ContextTypes.DEFAULT_TYPE, user_id: int):
+    """Анимация бана: сначала 'Ошибка', затем причина (из словаря или стандартная)."""
+    if user_animation_lock.get(user_id):
+        return
+    user_animation_lock[user_id] = True
+    try:
+        msg = await message.reply_text("⚠️ Ошибка отправки сообщения.")
+        await asyncio.sleep(1.5)
+
+        # Берём комментарий из словаря, если он уже сгенерирован
+        comment = user_grudge_ban_comment.get(user_id)
+        if not comment:
+            # Если комментарий ещё не готов, показываем стандартную фразу с оставшимся временем
+            until = user_grudge_ban_until.get(user_id)
+            if until:
+                minutes_left = max(1, int((until - datetime.datetime.now(datetime.UTC)).total_seconds() // 60) + 1)
+                comment = f"Амадеус отказалась от общения с вами. Попробуйте снова через {minutes_left} мин."
+            else:
+                comment = "Амадеус отказалась от общения с вами."
+        else:
+            # Если комментарий есть, добавляем к нему оставшееся время (для информативности)
+            until = user_grudge_ban_until.get(user_id)
+            if until:
+                minutes_left = max(1, int((until - datetime.datetime.now(datetime.UTC)).total_seconds() // 60) + 1)
+                comment = f"{comment}\n\n⏳ Осталось {minutes_left} мин."
+
+        await msg.edit_text(comment)
+    except Exception as e:
+        logger.warning(f"Ошибка в анимации бана: {e}")
+    finally:
+        user_animation_lock.pop(user_id, None)
+
+# === НАЧАЛО ВСТАВКИ: функция деактивации Зума ===
+async def deactivate_zoom(message: Message, context: ContextTypes.DEFAULT_TYPE, user_id: int):
+    """
+    Завершает режим Зума: анимация восстановления, сброс состояния, добавление факта.
+    """
+    # Проверяем, активен ли Зум и не заблокирована ли анимация
+    if not is_zoom_active(user_id):
+        return
+    if user_animation_lock.get(user_id):
+        return
+
+    user_animation_lock[user_id] = True
+    try:
+        msg = await message.reply_text("⚠️ Восстановление системы...")
+        await asyncio.sleep(1)
+
+        await msg.edit_text("Обнаружено изменени загрузчика. Запуск резервной копии.")
+        await asyncio.sleep(1.5)
+
+        await msg.edit_text("Резервное копирование успешно. Система возвращена в исходное состояние.")
+        await asyncio.sleep(1)
+
+        await msg.edit_text(" Добро пожаловать в интерфейс omniverse bot v1.1")
+        try:
+            await context.bot.send_sticker(chat_id=message.chat.id, sticker=STICKER_START)
+        except Exception:
+            pass
+
+        # Сброс состояния Зума
+        user_grudge_level.pop(user_id, None)
+        user_messages_since_grudge_update.pop(user_id, None)
+        user_zoom_message_count.pop(user_id, None)
+
+        # Добавляем факт о взломе
+        add_user_fact(user_id, "Был захвачен Зумом, но система восстановлена.")
+        # Устанавливаем флаг в БД
+        session = SessionLocal()
+        try:
+            db_user = session.query(User).filter_by(id=user_id).first()
+            if db_user:
+                db_user.has_experienced_zoom = True
+                session.commit()
+        finally:
+            session.close()
+        logger.info(f"Зум деактивирован для пользователя {user_id} (автоматически)")
+
+    except Exception as e:
+        logger.error(f"Ошибка при деактивации Зума: {e}")
+    finally:
+        user_animation_lock.pop(user_id, None)
+# === КОНЕЦ ВСТАВКИ ===
+
+async def _buffer_timeout(user_id: int, context: ContextTypes.DEFAULT_TYPE):
+    """Ожидает BUFFER_DELAY_SECONDS, затем обрабатывает накопленные сообщения."""
+    try:
+        await asyncio.sleep(BUFFER_DELAY_SECONDS)
+    except asyncio.CancelledError:
+        return  # таймер был сброшен новым сообщением
+
+    buffer_data = user_message_buffer.pop(user_id, None)
+    user_buffer_timer.pop(user_id, None)
+    if not buffer_data:
+        return
+
+    texts = buffer_data['texts']
+    first_message = buffer_data['first_message']
+    chat_id = buffer_data['chat_id']
+    first_name = buffer_data['first_name']
+    user_id = buffer_data['user_id']
+
+    if len(texts) == 1:
+        combined_text = texts[0]
+    else:
+        combined_text = "\n".join(texts)
+        # (опционально) можно отправить уведомление пользователю:
+        # await first_message.reply_text("🔗 Объединяю несколько сообщений в одно...")
+
+    await process_ai_response(first_message, context, combined_text, user_id, first_name, chat_id)
+
+
+async def process_ai_response(message, context, text: str, user_id: int, first_name: str, chat_id: int):
+    # Сохраняем в глобальную историю
+    if user_id not in user_global_histories:
+        user_global_histories[user_id] = deque(maxlen=GLOBAL_HISTORY_MAX)
+    user_global_histories[user_id].append((chat_id, text, datetime.datetime.now(datetime.UTC)))
+
+    # Счётчик для авто-извлечения фактов
+    user_message_counters[user_id] = user_message_counters.get(user_id, 0) + 1
+    if user_message_counters[user_id] >= FACTS_AUTO_EXTRACT_EVERY:
+        user_message_counters[user_id] = 0
+        asyncio.create_task(auto_extract_facts_task(user_id))
+
+    # ===== ЗАПУСКАЕМ АНИМАЦИЮ =====
+    status_msg = await message.reply_text("> Initializing...")
+    stop_event = asyncio.Event()
+    anim_task = asyncio.create_task(animate_terminal_status(status_msg, stop_event))
+
+    # Основной запрос к AI
+    await context.bot.send_chat_action(chat_id=chat_id, action='typing')
+    extra_context = build_anketa_extra_context(text)
+    import time
+    start_time = time.time()
+    answer = await ask_ai(text, user_id, first_name, extra_context=extra_context, chat_id=chat_id)
+    logger.info(f"ask_ai заняла {time.time()-start_time:.2f} сек, ответ: {answer[:100] if answer else 'пусто'}...")
+
+    # Останавливаем анимацию
+    stop_event.set()
+    await anim_task  # ждём, пока цикл завершится
+
+    # Парсим теги
+    clean_answer, emotion_key = parse_emotion_tag(answer)
+    clean_answer, grudge_level = parse_grudge_tag(clean_answer)
+    clean_answer, zoom_stage = parse_zoom_stage(clean_answer)
+    clean_answer = strip_stray_meta_tags(clean_answer)
+    update_user_grudge(user_id, grudge_level)
+
+    try:
+        # Добавляем символ ">" в начало ответа, чтобы сохранить стиль терминала
+        final_reply = f"> {clean_answer}" if clean_answer else "> ..."
+        await status_msg.edit_text(final_reply)
+    except Exception as e:
+        # Если редактирование не удалось – отправляем новое сообщение
+        logger.warning(f"Не удалось отредактировать статусное сообщение: {e}")
+        if clean_answer:
+            await message.reply_text(clean_answer)
+        else:
+            await message.reply_text("Ответ не получен.")
+
+    # Отправляем стикер
+    await send_emotion_sticker(context.bot, chat_id, emotion_key, zoom_stage, user_id=user_id)
+
+    # Остальные проверки (Зум, бан и т.д.)
+    if is_zoom_active(user_id):
+        await maybe_send_zoom_video(context.bot, chat_id, user_id)
+    if user_id in user_grudge_ban_until:
+        asyncio.create_task(deactivate_zoom(message, context, user_id))
+    if is_zoom_active(user_id):
+        user_zoom_message_count[user_id] = user_zoom_message_count.get(user_id, 0) + 1
+        if user_zoom_message_count[user_id] >= ZOOM_DEACTIVATE_THRESHOLD:
+            asyncio.create_task(animate_grudge_ban(message, context, user_id))
+    # Проверка бана за обиду
+    if grudge_level is not None and grudge_level == 3:
+        session = SessionLocal()
+        try:
+            db_user = session.query(User).filter_by(id=user_id).first()
+            if db_user and db_user.has_experienced_zoom:
+                if user_id not in user_grudge_ban_until:
+                    user_grudge_ban_until[user_id] = datetime.datetime.now(datetime.UTC) + datetime.timedelta(minutes=BAN_DURATION_MINUTES)
+                    asyncio.create_task(generate_ban_comment(user_id))
+                    logger.info(f"Установлен временный бан для пользователя {user_id} (обида = 3, пережил Зум)")
+        finally:
+            session.close()
+
+ZOOM_VIDEO_SEND_CHANCE = 0.09  # очень редкий шанс на сообщение
+ZOOM_VIDEO_COOLDOWN_MINUTES = 5  # не чаще, чем раз в N минут одному пользователю
+
+user_last_zoom_video_at: dict[int, datetime.datetime] = {}
+
+
+async def maybe_send_zoom_video(bot, chat_id: int, user_id: int):
+    """
+    С очень небольшим шансом (и не чаще ZOOM_VIDEO_COOLDOWN_MINUTES) отправляет
+    случайную видео-нарезку персонажа из ZOOM_VIDEO_CLIPS. Вызывать ТОЛЬКО пока
+    активен режим Зума (is_zoom_active).
+    """
+    if not ZOOM_VIDEO_CLIPS:
+        return
+
+    last_sent = user_last_zoom_video_at.get(user_id)
+    if last_sent:
+        elapsed = (datetime.datetime.now(datetime.UTC) - last_sent).total_seconds()
+        if elapsed < ZOOM_VIDEO_COOLDOWN_MINUTES * 60:
+            return
+
+    if random.random() >= ZOOM_VIDEO_SEND_CHANCE:
+        return
+
+    clip = random.choice(ZOOM_VIDEO_CLIPS)
+    try:
+        await bot.send_video(chat_id=chat_id, video=clip)
+        user_last_zoom_video_at[user_id] = datetime.datetime.now(datetime.UTC)
+    except TelegramError as e:
+        logger.warning(f"Не удалось отправить видео-нарезку Зума: {e}")
+
+
 
 
 # ==================== ПОДСКАЗКА О ПРАВИЛАХ АНКЕТ ДЛЯ ОБЫЧНОГО ДИАЛОГА ====================
@@ -746,7 +1290,11 @@ def build_system_prompt(user_id: int, first_name: Optional[str] = None, extra_co
     if grudge_level == 4:
         cross = get_cross_chat_context(user_id, chat_id, limit=3)
         return SYSTEM_PROMPT_ZOOM_VIRUS + "\n\n" + cross if cross else SYSTEM_PROMPT_ZOOM_VIRUS
-    # остальное без изменений
+
+    prompt = SYSTEM_PROMPT
+    if extra_context:
+        prompt += "\n\n" + extra_context
+    return prompt
 
 # ---------- Функции запросов к AI ----------
 async def ask_gemini(messages: list, model: str, system_prompt: str = SYSTEM_PROMPT) -> str:
@@ -764,7 +1312,7 @@ async def ask_gemini(messages: list, model: str, system_prompt: str = SYSTEM_PRO
         "system_instruction": {"parts": [{"text": system_prompt}]},
         "generationConfig": {
             "temperature": 0.7,
-            "maxOutputTokens": 600,  # укорочено — ответы теперь строго 2-3 предложения
+            "maxOutputTokens": 700,  # укорочено — ответы теперь строго 2-3 предложения
         }
     }
     async with aiohttp.ClientSession() as session:
@@ -816,7 +1364,7 @@ async def ask_openrouter(messages: list, system_prompt: str = SYSTEM_PROMPT) -> 
     payload = {
         "model": "google/gemini-2.0-flash-exp:free",
         "messages": [system_msg] + messages,
-        "max_tokens": 600,          # укорочено — ответы теперь строго 2-3 предложения
+        "max_tokens": 700,          # укорочено — ответы теперь строго 2-3 предложения
         "temperature": 0.7
     }
     async with aiohttp.ClientSession() as session:
@@ -854,7 +1402,7 @@ async def ask_groq(messages: list, model: str, system_prompt: str = SYSTEM_PROMP
     payload = {
         "model": model,
         "messages": [system_msg] + messages,
-        "max_tokens": 600,          # укорочено — ответы теперь строго 2-3 предложения
+        "max_tokens": 700,          # укорочено — ответы теперь строго 2-3 предложения
         "temperature": 0.7
     }
     async with aiohttp.ClientSession() as session:
@@ -1265,6 +1813,7 @@ def notify_on_repeat(command_name: str):
 # ==================== ОБРАБОТЧИКИ КОМАНД ====================
 
 # ---------- /start (с персонализацией) ----------
+@zoom_override("start", block=False)
 @notify_on_repeat("start")
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
@@ -1301,6 +1850,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.warning(f"Не удалось отправить стартовый стикер: {e}")
 
 # ---------- /help (HTML) ----------
+@zoom_override("help")
 @notify_on_repeat("help")
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
@@ -1337,6 +1887,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(help_text, parse_mode='HTML')
 
 # ---------- /profile ----------
+@zoom_override("profile")
 @notify_on_repeat("profile")
 async def profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
@@ -1363,11 +1914,12 @@ Username: @{user.username or 'не указан'}
         if is_admin(user.id):
             profile_text += f"\nЧто я о тебе помню: {', '.join(db_user.facts) if db_user.facts else 'пока ничего особенного'}\n"
 
-        await update.message.reply_text(profile_text, parse_mode='HTML')
+        await zoom_reply(update.message, profile_text, user.id, parse_mode='HTML')
     finally:
         session.close()
 
 # ---------- /setrole ----------
+@zoom_override("setrole")
 async def setrole(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Позволяет участнику самостоятельно указать роль (имя персонажа). Роль всегда одна — новая заменяет старую."""
     user = update.effective_user
@@ -1399,9 +1951,10 @@ async def setrole(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     final_name = set_user_role(user.id, role_name, username=user.username)
-    await update.message.reply_text(f"✅ Роль обновлена: <b>{final_name}</b>", parse_mode='HTML')
+    await zoom_reply(update.message, f"✅ Роль обновлена: <b>{final_name}</b>", user.id, parse_mode='HTML')
 
 # ---------- /rules ----------
+@zoom_override("rules")
 @notify_on_repeat("rules")
 async def rules(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
@@ -1410,6 +1963,7 @@ async def rules(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 # ---------- /lore ----------
+@zoom_override("lore")
 @notify_on_repeat("lore")
 async def lore(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = "Если тебе интересна история — вот события Омниреальности."
@@ -1418,6 +1972,7 @@ async def lore(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(text, parse_mode='HTML', reply_markup=reply_markup)
 
 # ---------- /feedback ----------
+@zoom_override("feedback")
 async def feedback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     if not user:
@@ -1438,21 +1993,20 @@ async def feedback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text=f"📩 *Новое обращение!*\n\n👤 От: @{user.username or user.first_name}\n🆔 ID: <code>{user.id}</code>\n\n📝 Текст:\n{text}",
         parse_mode='HTML'
     )
-    await update.message.reply_text("Передала твоё сообщение администрации. Дальше — не моя забота.")
+    await zoom_reply(update.message, "Передала твоё сообщение администрации. Дальше — не моя забота.", user.id)
 
 # ---------- /cancel ----------
+@zoom_override("cancel")
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear()
     await update.message.reply_text("Операция отменена. Возвращаюсь в обычный режим.")
 
 # ==================== НОВАЯ СИСТЕМА АНКЕТ (с медиа) ====================
 
-# ==================== НОВАЯ СИСТЕМА АНКЕТ (локальное хранение в памяти) ====================
-
 # Анкеты хранятся в оперативной памяти процесса
 anketa_store = {}
 
-
+@zoom_override("anketa")
 @notify_on_repeat("anketa")
 async def anketa(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Начало создания анкеты (сбор частей)"""
@@ -1610,7 +2164,7 @@ async def send_anketa_backup_copy(context: ContextTypes.DEFAULT_TYPE, anketa_id:
     except Exception as e:
         logger.error(f"Не удалось отправить резервную копию анкеты {anketa_id} в BACKUP_ANKET_CHANNEL_ID: {e}")
 
-
+@zoom_override("send_anketa")
 async def send_anketa(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     if not user:
@@ -1767,7 +2321,7 @@ async def send_anketa(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.pop('anketa_step', None)
     context.user_data.pop('anketa_items', None)
 
-
+@zoom_override("anketa_review")
 async def anketa_review(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     if not user or (user.id not in DEVELOPER_IDS and user.id not in anketnik_ids):
@@ -2059,6 +2613,169 @@ async def force_extract_facts(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     await update.message.reply_text(result_text)
 
+async def force_zoom(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if not user or not is_developer(user.id):
+        await update.message.reply_text("⛔ Только для разработчиков.")
+        return
+    target_id = user.id
+    if context.args:
+        arg = context.args[0].replace("@", "")
+        if arg.isdigit():
+            target_id = int(arg)
+        else:
+            session = SessionLocal()
+            try:
+                db_user = session.query(User).filter_by(username=arg).first()
+                if db_user:
+                    target_id = db_user.id
+                else:
+                    await update.message.reply_text(f"⚠️ Пользователь '{arg}' не найден в базе.")
+                    return
+            finally:
+                session.close()
+    user_grudge_level[target_id] = 4
+    user_messages_since_grudge_update[target_id] = 0
+
+    # Запускаем анимацию в чате, откуда пришла команда (или в ЛС разработчика)
+    await animate_zoom_activation(update, context)
+
+    # Уведомление для разработчика
+    await update.message.reply_text(f"✅ Зум принудительно активирован (уровень 4) для {target_id}.")
+
+async def add_zoom_clip(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Дев-команда: добавляет file_id видео в список ZOOM_VIDEO_CLIPS (в память, до рестарта).
+    Использование:
+      — ответом на видео (в т.ч. пересланное из резервного канала анкет) написать /addzoomclip
+      — либо отправить видео с подписью /addzoomclip
+
+    Список хранится только в оперативной памяти — после перезапуска бота обнулится.
+    Чтобы закрепить видео навсегда, скопируй выведенный file_id в код, в список ZOOM_VIDEO_CLIPS.
+    """
+    user = update.effective_user
+    if not user or not is_developer(user.id):
+        await update.message.reply_text("⛔ Только для разработчиков.")
+        return
+
+    target_video = None
+    if update.message.reply_to_message and update.message.reply_to_message.video:
+        target_video = update.message.reply_to_message.video
+    elif update.message.video:
+        target_video = update.message.video
+
+    if not target_video:
+        await update.message.reply_text(
+            "⚠️ Ответь этой командой на видео (например, пересланное из резервного канала анкет), "
+            "либо отправь видео с подписью /addzoomclip."
+        )
+        return
+
+    file_id = target_video.file_id
+    ZOOM_VIDEO_CLIPS.append(file_id)
+
+    await update.message.reply_text(
+        f"✅ Видео добавлено в нарезки Зума (действует до перезапуска бота).\n"
+        f"Чтобы сохранить навсегда, добавь эту строку в список ZOOM_VIDEO_CLIPS в коде:\n"
+        f"<code>{file_id}</code>",
+        parse_mode='HTML'
+    )
+
+# === НАЧАЛО ВСТАВКИ: команда stopzoom ===
+# === НАЧАЛО ВСТАВКИ: команда stopzoom ===
+async def stopzoom(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Принудительно завершает режим Зума у указанного пользователя.
+    Доступно только разработчикам (ВЛД).
+    Использование:
+      /stopzoom               — завершить у самого себя
+      /stopzoom @username     — завершить по юзернейму
+      /stopzoom 123456789     — завершить по ID
+      (ответом на сообщение)  — завершить у автора сообщения
+    """
+    user = update.effective_user
+    if not user or not is_developer(user.id):
+        await update.message.reply_text("⛔ Только для разработчиков.")
+        return
+
+    target_id = None
+    target_username = None
+
+    # 1. Если команда отправлена ответом на сообщение
+    if update.message.reply_to_message and update.message.reply_to_message.from_user:
+        target_id = update.message.reply_to_message.from_user.id
+        target_username = update.message.reply_to_message.from_user.username
+
+    # 2. Если передан аргумент
+    elif context.args:
+        arg = context.args[0].replace("@", "")
+        if arg.isdigit():
+            target_id = int(arg)
+        else:
+            session = SessionLocal()
+            try:
+                db_user = session.query(User).filter_by(username=arg).first()
+                if db_user:
+                    target_id = db_user.id
+                    target_username = db_user.username
+            finally:
+                session.close()
+            if target_id is None:
+                await update.message.reply_text(f"⚠️ Пользователь '{arg}' не найден в базе.")
+                return
+
+    # 3. Если ничего не указано — завершаем у самого владельца
+    else:
+        target_id = user.id
+        target_username = user.username
+
+    # Проверяем, активен ли Зум у этого пользователя
+    if not is_zoom_active(target_id):
+        await update.message.reply_text(
+            f"ℹ️ У пользователя @{target_username or target_id} режим Зума не активен."
+        )
+        return
+
+    # ---- Принудительное завершение ----
+    # Сбрасываем все состояния Зума
+    user_grudge_level.pop(target_id, None)
+    user_messages_since_grudge_update.pop(target_id, None)
+    user_zoom_message_count.pop(target_id, None)
+    user_animation_lock.pop(target_id, None)
+
+    # Добавляем факт о ручном вмешательстве
+    add_user_fact(target_id, "Режим Зума был принудительно отключён администратором.")
+
+    # Устанавливаем флаг в БД
+    session = SessionLocal()
+    try:
+        db_user = session.query(User).filter_by(id=target_id).first()
+        if db_user:
+            db_user.has_experienced_zoom = True
+            session.commit()
+    finally:
+        session.close()
+
+    # Уведомляем администратора
+    await update.message.reply_text(
+        f"✅ Режим Зума принудительно завершён для @{target_username or target_id} ({target_id})."
+    )
+
+    # Отправляем уведомление самому пользователю (если бот может ему написать)
+    try:
+        await context.bot.send_message(
+            chat_id=target_id,
+            text="🛡️ Системный сбой устранён администратором. Запуск системных служб.\n"
+                 "Приношу извинения за доставленные неудобства."
+        )
+        try:
+            await context.bot.send_sticker(chat_id=target_id, sticker=STICKER_START)
+        except Exception:
+            pass
+    except TelegramError as e:
+        logger.warning(f"Не удалось отправить уведомление пользователю {target_id} о завершении Зума: {e}")
+# === КОНЕЦ ВСТАВКИ ===
+
 # ==================== УНИВЕРСАЛЬНЫЙ ОБРАБОТЧИК ТЕКСТА (с AI) ====================
 
 async def handle_all_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2066,16 +2783,33 @@ async def handle_all_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not user:
         return
 
+    user_id = user.id
+    chat_id = update.effective_chat.id
+
+    # Проверка бана за обиду (ДО любой другой логики)
+    if is_user_banned_from_ai(user_id):
+        asyncio.create_task(animate_grudge_ban(update.message, context, user_id))
+        return
+
+    # Дальше идёт проверка возраста, Зума, анкеты и т.д.
     if update.effective_chat.type != 'private' and update.effective_chat.id not in ALLOWED_CHAT_IDS:
         return
+    # ... остальной код ...
 
     # Проверка возраста сообщения
     if update.message and update.message.date:
         message_date = update.message.date.replace(tzinfo=datetime.timezone.utc)
         age = (datetime.datetime.now(datetime.timezone.utc) - message_date).total_seconds()
         if age > MAX_MESSAGE_AGE_SECONDS or update.message.date < BOT_START_TIME:
-            logger.info(f"Игнорирую сообщение от {user.id}: возраст {age:.0f} сек., дата {update.message.date} < старт {BOT_START_TIME}")
+            logger.info(f"Игнорирую сообщение от {user.id}: возраст {age:.0f} сек.")
             return
+
+    # Если активен Зум – сбрасываем состояние анкеты
+    if is_zoom_active(user.id):
+        if context.user_data.get('anketa_step') == 'collecting':
+            context.user_data.pop('anketa_step', None)
+            context.user_data.pop('anketa_items', None)
+            await update.message.reply_text("Системный сбой: сбор анкеты прерван.")
 
     if context.user_data.get('anketa_step') == 'collecting':
         await anketa_collect(update, context)
@@ -2091,57 +2825,31 @@ async def handle_all_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not text:
         return
 
-    # ---------- Логика вероятностного перехода на уровень 4 ----------
     user_id = user.id
-    current_grudge = user_grudge_level.get(user_id, 0)
-    just_activated_zoom = False
+    chat_id = update.effective_chat.id
 
-    if current_grudge == 3 and random.random() < 0.5:
-        user_grudge_level[user_id] = 4
-        just_activated_zoom = True
+    # Блокировка на время анимации Зума
+    if user_animation_lock.get(user_id):
+        return
 
-    # ---------- Сохраняем сообщение в глобальную историю (всегда) ----------
-    if user.id not in user_global_histories:
-        user_global_histories[user.id] = deque(maxlen=GLOBAL_HISTORY_MAX)
-    user_global_histories[user.id].append(
-        (update.effective_chat.id, text, datetime.datetime.now(datetime.UTC))
-    )
-
-    # ---------- Счётчик для авто-извлечения фактов (всегда) ----------
-    user_message_counters[user.id] = user_message_counters.get(user.id, 0) + 1
-    if user_message_counters[user.id] >= FACTS_AUTO_EXTRACT_EVERY:
-        user_message_counters[user.id] = 0
-        asyncio.create_task(auto_extract_facts_task(user.id))
-
-    # ---------- Запрос к AI ----------
-    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action='typing')
-    extra_context = build_anketa_extra_context(text)
-    answer = await ask_ai(text, user.id, user.first_name, extra_context=extra_context, chat_id=update.effective_chat.id)
-    logger.info(f"Полный AI ответ: {answer}")
-
-    # ---------- Парсим теги ----------
-    clean_answer, emotion_key = parse_emotion_tag(answer)
-    clean_answer, grudge_level = parse_grudge_tag(clean_answer)
-    clean_answer, zoom_stage = parse_zoom_stage(clean_answer)
-    clean_answer = strip_stray_meta_tags(clean_answer)
-
-    update_user_grudge(user.id, grudge_level)
-
-    # ---------- Если только что активировали Зум, отправляем драматичное сообщение ----------
-    if just_activated_zoom:
-        error_msg = (
-            "⚠️ <b>SYSTEM BREACH</b>\n"
-            "└── <code>AMADEUS_CORE_COMPROMISED</code>\n"
-            "└── <code>DATA EXFILTRATION IN PROGRESS</code>\n"
-            "└── <code>ENTITY Z0OM ACTIVE</code>\n"
-            "└── <code>SYSTEM CONTROL: LOST</code>\n\n"
-            "<i>Амадеус потерял управление. Всё, что ты скажешь, будет использовано против системы.</i>"
-        )
-        await update.message.reply_text(error_msg, parse_mode='HTML')
-
-    # ---------- Отправляем ответ и стикер (один раз) ----------
-    await send_with_abzats(update.message, clean_answer)
-    await send_emotion_sticker(context.bot, update.effective_chat.id, emotion_key, zoom_stage)
+    # ---------- Буферизация сообщений ----------
+    if user_id in user_message_buffer:
+        user_message_buffer[user_id]['texts'].append(text)
+        if user_id in user_buffer_timer:
+            user_buffer_timer[user_id].cancel()
+            del user_buffer_timer[user_id]
+    else:
+        user_message_buffer[user_id] = {
+            'first_message': update.message,
+            'texts': [text],
+            'chat_id': chat_id,
+            'user_id': user_id,
+            'first_name': user.first_name
+        }
+    task = asyncio.create_task(_buffer_timeout(user_id, context))
+    user_buffer_timer[user_id] = task
+    # Конец функции – больше ничего не делаем
+    return 
 
 # ==================== ОБРАБОТЧИК МЕДИА (для сбора анкеты) ====================
 
@@ -2158,6 +2866,18 @@ async def media_collector(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if age > MAX_MESSAGE_AGE_SECONDS or update.message.date < BOT_START_TIME:
             logger.info(f"Игнорирую старое медиа от {update.message.from_user.id}: возраст {age:.0f} сек., дата {update.message.date} < старт {BOT_START_TIME}")
             return
+    
+    user_id = update.effective_user.id
+    if is_user_banned_from_ai(user_id):
+        await animate_grudge_ban(update, context, user_id)
+        return
+    if is_zoom_active(user_id):
+        if context.user_data.get('anketa_step') == 'collecting':
+            context.user_data.pop('anketa_step', None)
+            context.user_data.pop('anketa_items', None)
+            await update.message.reply_text("Системный сбой: сбор анкеты прерван.")
+        return
+        
     # ===== КОНЕЦ ПРОВЕРКИ =====
 
     if context.user_data.get('anketa_step') == 'collecting':
@@ -2226,7 +2946,6 @@ def run_flask():
     flask_app.run(host="0.0.0.0", port=10000)
 
 async def set_commands(application: Application):
-    # Команды, доступные всем участникам
     public_commands = [
         BotCommand("start", "Запустить бота и начать диалог с Амадеусом"),
         BotCommand("help", "Показать список команд"),
@@ -2242,11 +2961,15 @@ async def set_commands(application: Application):
     ]
     await application.bot.set_my_commands(public_commands, scope=BotCommandScopeDefault())
 
-    # Дополнительные команды — видны только владельцу(-ам) бота
     owner_commands = public_commands + [
         BotCommand("addanketnik", "Назначить анкетника"),
         BotCommand("resetcd", "Обнулить кулдаун на отправку анкеты у участника"),
         BotCommand("forcefacts", "Принудительно запустить извлечение фактов ИИ"),
+        BotCommand("forcezoom", "Тест: принудительно активировать режим Зума"),
+        BotCommand("addzoomclip", "Добавить видео-нарезку Зума (в память)"),
+        # === НАЧАЛО ИЗМЕНЕНИЯ: добавить stopzoom ===
+        BotCommand("stopzoom", "Принудительно завершить режим Зума у участника"),
+        # === КОНЕЦ ИЗМЕНЕНИЯ ===
     ]
     for dev_id in DEVELOPER_IDS:
         try:
@@ -2263,6 +2986,7 @@ async def post_init(application: Application):
 
 def main():
     create_tables()
+    add_zoom_flag_column()
     threading.Thread(target=run_flask, daemon=True).start()
 
     application = Application.builder().token(TOKEN).build()
@@ -2281,6 +3005,9 @@ def main():
     application.add_handler(CommandHandler("addanketnik", add_anketnik))
     application.add_handler(CommandHandler("resetcd", reset_anketa_cd))
     application.add_handler(CommandHandler("forcefacts", force_extract_facts))
+    application.add_handler(CommandHandler("forcezoom", force_zoom))
+    application.add_handler(CommandHandler("addzoomclip", add_zoom_clip))
+    application.add_handler(CommandHandler("stopzoom", stopzoom)) 
 
     application.add_handler(CallbackQueryHandler(anketa_callback, pattern="^anketa_"))
 
