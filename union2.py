@@ -765,19 +765,76 @@ user_grudge_level: dict[int, int] = {}
 user_messages_since_grudge_update: dict[int, int] = {}
 GRUDGE_DECAY_EVERY = 4  # если новый уровень не подтверждается тегом — обида слабеет каждые N сообщений
 
-def update_user_grudge(user_id: int, new_level: Optional[int]):
-    """Обновляет уровень обиды на пользователя."""
+# Темп роста обиды: ИИ может ХОТЕТЬ поднять уровень хоть каждое сообщение,
+# но фактически рост разрешён не чаще, чем раз в GRUDGE_MIN_MESSAGES_BETWEEN_INCREASES сообщений,
+# и не больше чем на 1 уровень за раз. Это растягивает путь от 0 до 3 примерно на ~9-10 сообщений.
+GRUDGE_MIN_MESSAGES_BETWEEN_INCREASES = 3
+user_grudge_msg_counter: dict[int, int] = {}       # user_id -> счётчик сообщений (для темпа роста)
+user_grudge_last_increase_at: dict[int, int] = {}  # user_id -> номер сообщения, на котором обида росла в последний раз
+
+GRUDGE_ZOOM_ESCALATION_MESSAGES = 6  # сколько сообщений подряд обида должна держаться на уровне 3, чтобы прорвало в Зум
+user_grudge_high_streak: dict[int, int] = {}  # user_id -> сколько подряд сообщений уровень обиды = 3
+
+def _user_has_experienced_zoom(user_id: int) -> bool:
+    session = SessionLocal()
+    try:
+        user = session.query(User).filter_by(id=user_id).first()
+        return bool(user and user.has_experienced_zoom)
+    finally:
+        session.close()
+
+
+def update_user_grudge(user_id: int, new_level: Optional[int]) -> bool:
+    """
+    Обновляет уровень обиды на пользователя, с учётом темпа роста.
+    Возвращает True, если именно в этот момент обида прорвалась в полноценный Зум (уровень 4).
+    """
+    msg_count = user_grudge_msg_counter.get(user_id, 0) + 1
+    user_grudge_msg_counter[user_id] = msg_count
+
+    current = user_grudge_level.get(user_id, 0)
+
     if new_level is not None:
-        user_grudge_level[user_id] = new_level
+        if new_level > current:
+            last_increase_at = user_grudge_last_increase_at.get(user_id, 0)
+            messages_since_increase = msg_count - last_increase_at
+            if last_increase_at == 0 or messages_since_increase >= GRUDGE_MIN_MESSAGES_BETWEEN_INCREASES:
+                # Разрешаем расти, но строго на 1 уровень за раз — так путь к пику растягивается,
+                # даже если нейронка сразу хочет прыгнуть с 0 на 3.
+                current = current + 1
+                user_grudge_level[user_id] = current
+                user_grudge_last_increase_at[user_id] = msg_count
+            # иначе рост игнорируем — лимит по темпу ещё не прошёл
+        elif new_level < current:
+            # Смягчение разрешаем сразу, без ограничений по темпу
+            current = new_level
+            user_grudge_level[user_id] = current
         user_messages_since_grudge_update[user_id] = 0
     else:
-        # Постепенное уменьшение обиды (если не получен новый тег)
-        current = user_grudge_level.get(user_id, 0)
-        if current > 0 and current != 4:  # 4 – Зум, его не трогаем
+        if current > 0 and current != 4:
             user_messages_since_grudge_update[user_id] = user_messages_since_grudge_update.get(user_id, 0) + 1
             if user_messages_since_grudge_update[user_id] >= GRUDGE_DECAY_EVERY:
-                user_grudge_level[user_id] = max(0, current - 1)
+                current = max(0, current - 1)
+                user_grudge_level[user_id] = current
                 user_messages_since_grudge_update[user_id] = 0
+
+    if current == 3:
+        streak = user_grudge_high_streak.get(user_id, 0) + 1
+        user_grudge_high_streak[user_id] = streak
+
+        if streak >= GRUDGE_ZOOM_ESCALATION_MESSAGES:
+            user_grudge_high_streak.pop(user_id, None)
+            if not _user_has_experienced_zoom(user_id):
+                user_grudge_level[user_id] = 4
+                user_messages_since_grudge_update[user_id] = 0
+                return True
+            # Уже переживал Зум раньше — не даём счётчику расти бесконечно,
+            # дальше сработает обычный бан по логике grudge == 3.
+            user_grudge_high_streak[user_id] = GRUDGE_ZOOM_ESCALATION_MESSAGES - 1
+    else:
+        user_grudge_high_streak.pop(user_id, None)
+
+    return False
 
 # Стикеры Зума не должны сыпаться на каждое сообщение — шлём их не чаще, чем раз в N сообщений.
 user_zoom_sticker_counters: dict[int, int] = {}
@@ -973,15 +1030,14 @@ ZOOM_VIDEO_CLIPS: list[str] = [
     "BAACAgIAAx0CZnWtWwADU2qddd22y1EsPGCNA2kpgac4A54FAAI6pQAC8cXwSM8xF4Ji0inxPQQ"
 ]
 
-async def animate_zoom_activation(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def animate_zoom_activation(message: Message, context: ContextTypes.DEFAULT_TYPE, user_id: int, chat_id: int):
     """
     Отправляет анимацию ошибки, загрузки OS, финальную фразу и стикер.
     Без видео. Блокирует обработку сообщений от пользователя на время анимации.
     """
-    user_id = update.effective_user.id
     user_animation_lock[user_id] = True  # блокируем
     try:
-        msg = await update.message.reply_text("⚠️ SYSTEM BREACH")
+        msg = await message.reply_text("⚠️ SYSTEM BREACH")
         await asyncio.sleep(0.8)
 
         lines = [
@@ -1015,7 +1071,7 @@ async def animate_zoom_activation(update: Update, context: ContextTypes.DEFAULT_
 
     except Exception as e:
         logger.warning(f"Ошибка при анимации активации Зума: {e}")
-        await update.message.reply_text("⚠️ SYSTEM BREACH\nSYSTEM OVERRIDE COMPLETE.")
+        await message.reply_text("⚠️ SYSTEM BREACH\nSYSTEM OVERRIDE COMPLETE.")
 
     finally:
         # Снимаем блокировку после завершения анимации
@@ -1024,7 +1080,7 @@ async def animate_zoom_activation(update: Update, context: ContextTypes.DEFAULT_
     # ---- Финальная фраза и стикер ----
     await asyncio.sleep(0.5)
     try:
-        phrase_msg = await update.message.reply_text("You can't lock up the darkness.")
+        phrase_msg = await message.reply_text("You can't lock up the darkness.")
         await asyncio.sleep(1.2)
         await phrase_msg.edit_text(
             "You can't lock up the darkness.\n\n"
@@ -1032,7 +1088,7 @@ async def animate_zoom_activation(update: Update, context: ContextTypes.DEFAULT_
         )
         await asyncio.sleep(0.5)
         await context.bot.send_sticker(
-            chat_id=update.effective_chat.id,
+            chat_id=chat_id,
             sticker="CAACAgIAAxkBA4l-fmqdQJsynhDahR6LFspPPIgpyqaCAAIfcAACqxP4SC-4cR1OdrQ9PQQ"
         )
     except Exception as e:
@@ -1184,7 +1240,7 @@ async def process_ai_response(message, context, text: str, user_id: int, first_n
     clean_answer, grudge_level = parse_grudge_tag(clean_answer)
     clean_answer, zoom_stage = parse_zoom_stage(clean_answer)
     clean_answer = strip_stray_meta_tags(clean_answer)
-    update_user_grudge(user_id, grudge_level)
+    escalate_now = update_user_grudge(user_id, grudge_level)
 
     try:
         # Добавляем символ ">" в начало ответа, чтобы сохранить стиль терминала
@@ -1199,7 +1255,13 @@ async def process_ai_response(message, context, text: str, user_id: int, first_n
             await message.reply_text("Ответ не получен.")
 
     # Отправляем стикер
+        # Отправляем стикер
     await send_emotion_sticker(context.bot, chat_id, emotion_key, zoom_stage, user_id=user_id)
+
+    if escalate_now:
+        asyncio.create_task(animate_zoom_activation(message, context, user_id, chat_id))
+
+    # Остальные проверки (Зум, бан и т.д.)
 
     # Остальные проверки (Зум, бан и т.д.)
     if is_zoom_active(user_id):
@@ -2638,7 +2700,7 @@ async def force_zoom(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_messages_since_grudge_update[target_id] = 0
 
     # Запускаем анимацию в чате, откуда пришла команда (или в ЛС разработчика)
-    await animate_zoom_activation(update, context)
+    await animate_zoom_activation(update.message, context, target_id, update.effective_chat.id)
 
     # Уведомление для разработчика
     await update.message.reply_text(f"✅ Зум принудительно активирован (уровень 4) для {target_id}.")
