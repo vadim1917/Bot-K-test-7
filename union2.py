@@ -814,7 +814,7 @@ async def ask_openrouter(messages: list, system_prompt: str = SYSTEM_PROMPT) -> 
     }
     system_msg = {"role": "system", "content": system_prompt}
     payload = {
-        "model": "openrouter/free",
+        "model": "google/gemini-2.0-flash-exp:free",
         "messages": [system_msg] + messages,
         "max_tokens": 600,          # укорочено — ответы теперь строго 2-3 предложения
         "temperature": 0.7
@@ -2071,7 +2071,8 @@ async def handle_all_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Проверка возраста сообщения
     if update.message and update.message.date:
-        age = (datetime.datetime.now(datetime.UTC) - update.message.date).total_seconds()
+        message_date = update.message.date.replace(tzinfo=datetime.timezone.utc)
+        age = (datetime.datetime.now(datetime.timezone.utc) - message_date).total_seconds()
         if age > MAX_MESSAGE_AGE_SECONDS or update.message.date < BOT_START_TIME:
             logger.info(f"Игнорирую сообщение от {user.id}: возраст {age:.0f} сек., дата {update.message.date} < старт {BOT_START_TIME}")
             return
@@ -2178,7 +2179,7 @@ def cleanup_inactive_users():
     """
     session = SessionLocal()
     try:
-        threshold_date = datetime.datetime.now(datetime.UTC) - datetime.timedelta(days=INACTIVE_DAYS_THRESHOLD)
+        threshold_date = datetime.datetime.now() - datetime.timedelta(days=INACTIVE_DAYS_THRESHOLD)
         inactive_users = (
             session.query(User)
             .filter(
