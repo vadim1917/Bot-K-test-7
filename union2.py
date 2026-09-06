@@ -2705,6 +2705,59 @@ async def force_zoom(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Уведомление для разработчика
     await update.message.reply_text(f"✅ Зум принудительно активирован (уровень 4) для {target_id}.")
 
+async def force_grudge(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Дев-команда для быстрого теста: сразу выставляет уровень обиды 3 и почти
+    дожимает счётчик стрика — следующее любое сообщение пользователя боту
+    тут же вызовет переход в Зум (если пользователь ещё не переживал его).
+
+    Использование:
+      /forcegrudge                — по себе
+      /forcegrudge @username      — по юзернейму
+      /forcegrudge 123456789      — по ID
+      (ответом на сообщение)      — по автору сообщения
+    """
+    user = update.effective_user
+    if not user or not is_developer(user.id):
+        await update.message.reply_text("⛔ Только для разработчиков.")
+        return
+
+    target_id = None
+
+    if update.message.reply_to_message and update.message.reply_to_message.from_user:
+        target_id = update.message.reply_to_message.from_user.id
+    elif context.args:
+        arg = context.args[0].replace("@", "")
+        if arg.isdigit():
+            target_id = int(arg)
+        else:
+            session = SessionLocal()
+            try:
+                db_user = session.query(User).filter_by(username=arg).first()
+                if db_user:
+                    target_id = db_user.id
+            finally:
+                session.close()
+            if target_id is None:
+                await update.message.reply_text(f"⚠️ Пользователь '{arg}' не найден в базе.")
+                return
+    else:
+        target_id = user.id
+
+    user_grudge_level[target_id] = 3
+    user_messages_since_grudge_update[target_id] = 0
+    user_grudge_last_increase_at[target_id] = user_grudge_msg_counter.get(target_id, 0)
+    # Дожимаем стрик почти до предела — следующее сообщение с уровнем 3
+    # (в том числе просто "не остывшее" без нового тега) добьёт до Зума.
+    user_grudge_high_streak[target_id] = GRUDGE_ZOOM_ESCALATION_MESSAGES - 1
+
+    await update.message.reply_text(
+        f"✅ Уровень обиды для {target_id} выставлен на 3, стрик почти дожат "
+        f"({GRUDGE_ZOOM_ESCALATION_MESSAGES - 1}/{GRUDGE_ZOOM_ESCALATION_MESSAGES}).\n"
+        f"Следующее любое сообщение этого пользователя боту должно вызвать переход в Зум."
+    )
+
+
 async def add_zoom_clip(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     Дев-команда: добавляет file_id видео в список ZOOM_VIDEO_CLIPS (в память, до рестарта).
@@ -3068,6 +3121,7 @@ def main():
     application.add_handler(CommandHandler("resetcd", reset_anketa_cd))
     application.add_handler(CommandHandler("forcefacts", force_extract_facts))
     application.add_handler(CommandHandler("forcezoom", force_zoom))
+    application.add_handler(CommandHandler("forcegrudge", force_grudge))
     application.add_handler(CommandHandler("addzoomclip", add_zoom_clip))
     application.add_handler(CommandHandler("stopzoom", stopzoom)) 
 
