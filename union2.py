@@ -851,6 +851,126 @@ ZOOM_DEACTIVATE_THRESHOLD = 20   # количество сообщений в р
 user_zoom_message_count = {}     # user_id -> количество сообщений в режиме Зума (для отсчёта)
 # === КОНЕЦ ВСТАВКИ ===
 
+# ==================== ПЕРИОД "ВОССТАНОВЛЕНИЯ" ПОСЛЕ ЗУМА ====================
+RECOVERY_COMMANDS_REMAINING = 5  # столько следующих команд после Зума идут "со сбоями"
+user_post_zoom_recovery: dict[int, int] = {}  # user_id -> сколько команд ещё осталось "глючить"
+
+RECOVERY_FLAVOR_COMMENTS = [
+    "Секунду... что-то ещё фонит после этого вмешательства. Сейчас, сейчас всё будет.",
+    "Прости, я... немного не в себе после случившегося. Дай попробую ещё раз.",
+    "Система ещё нестабильна. Не обращай внимания, сейчас исправлю.",
+    "Странно... как будто что-то ещё цепляется за старые процессы. Секунду.",
+]
+
+RECOVERY_RETRY_STAGES = [
+    "> Loading module...",
+    "> ERROR: module corrupted, retrying...",
+    "> Loading module... [attempt 2]",
+]
+
+async def animate_recovery_retry(message: Message):
+    """
+    Короткая анимация 'сбойной' загрузки перед выполнением команды — имитация того,
+    что система ещё не до конца стабилизировалась после Зума (загружается только
+    со второй попытки).
+    """
+    msg = await message.reply_text(RECOVERY_RETRY_STAGES[0])
+    for stage in RECOVERY_RETRY_STAGES[1:]:
+        await asyncio.sleep(0.7)
+        try:
+            await msg.edit_text(stage)
+        except Exception:
+            pass
+    await asyncio.sleep(0.5)
+    try:
+        await msg.edit_text("> OK, продолжаю.")
+    except Exception:
+        pass
+
+
+def with_recovery_flavor(command_name: str):
+    """
+    Декоратор: пока пользователь находится в периоде восстановления после Зума,
+    перед выполнением команды показывает сбойный "ретрай" загрузки и смущённый
+    комментарий Амадеус, затем как обычно выполняет саму команду.
+    """
+    def decorator(func):
+        @functools.wraps(func)
+        async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE, *args, **kwargs):
+            user = update.effective_user
+            if user and update.message and user_post_zoom_recovery.get(user.id, 0) > 0:
+                user_post_zoom_recovery[user.id] -= 1
+                if user_post_zoom_recovery[user.id] <= 0:
+                    user_post_zoom_recovery.pop(user.id, None)
+                await animate_recovery_retry(update.message)
+                await update.message.reply_text(random.choice(RECOVERY_FLAVOR_COMMENTS))
+            return await func(update, context, *args, **kwargs)
+        return wrapper
+    return decorator
+
+def with_command_loading(command_name: str):
+    """
+    Декоратор: перед выполнением команды коротко показывает анимацию загрузки
+    в стиле терминала, затем удаляет её и выполняет саму команду как обычно.
+    Пропускается, если у пользователя сейчас идёт период "восстановления" после
+    Зума — там уже есть своя (более длинная) сбойная анимация, дублировать не нужно.
+    """
+    def decorator(func):
+        @functools.wraps(func)
+        async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE, *args, **kwargs):
+            user = update.effective_user
+            if user and update.message and user_post_zoom_recovery.get(user.id, 0) <= 0:
+                loading_msg = await update.message.reply_text("> Loading")
+                for dots in (".", "..", "..."):
+                    await asyncio.sleep(0.25)
+                    try:
+                        await loading_msg.edit_text(f"> Loading{dots}")
+                    except Exception:
+                        pass
+                try:
+                    await loading_msg.delete()
+                except Exception:
+                    pass
+            return await func(update, context, *args, **kwargs)
+        return wrapper
+    return decorator
+
+async def send_terminal_typed(message: Message, text: str, parse_mode: Optional[str] = None, words_per_step: int = 3, delay: float = 0.05):
+    """
+    Отправляет текст, "печатая" его порциями слов (эффект вывода в терминале),
+    затем заменяет финальным полным текстом (с HTML-разметкой, если она передана).
+    Во время печати теги разметки скрыты, чтобы не мелькали недорисованные <b> и т.п.
+    """
+    plain_text = re.sub(r'<[^>]+>', '', text) if parse_mode else text
+    words = plain_text.split(" ")
+    if not words or not words[0]:
+        await message.reply_text(text, parse_mode=parse_mode)
+        return
+
+    max_steps = 40  # ограничение, чтобы очень длинный текст не печатался слишком долго
+    step = max(words_per_step, len(words) // max_steps + 1)
+
+    msg = None
+    built = ""
+    for i in range(0, len(words), step):
+        chunk = " ".join(words[i:i + step])
+        built = (built + " " + chunk).strip() if built else chunk
+        if msg is None:
+            msg = await message.reply_text(built)
+        else:
+            try:
+                await msg.edit_text(built)
+            except Exception:
+                pass
+        await asyncio.sleep(delay)
+
+    if msg is None:
+        await message.reply_text(text, parse_mode=parse_mode)
+        return
+    try:
+        await msg.edit_text(text, parse_mode=parse_mode)
+    except Exception:
+        pass
 
 async def generate_ban_comment(user_id: int):
     """Фоновая задача: генерирует комментарий Амадеуса для бана и сохраняет в словарь."""
@@ -1012,6 +1132,29 @@ def zoom_corrupt(text: str) -> str:
         return f"{text}—\n\n`{glitch}`"
     return f"{text}\n\n`{glitch}`"
 
+# ---------- Анимация статуса во время Зума (вместо обычных "> Initializing...") ----------
+ZOOM_SCRAMBLE_CHARS = "#$%&@!?01_-/\\<>[]{}=+*^~"
+
+async def animate_zoom_terminal_status(status_msg: Message, stop_event: asyncio.Event):
+    """
+    Пока активен Зум, вместо нейтральной анимации Амадеус показываем поток
+    случайных символов и обрывки глючных фраз — имитация перехваченного канала.
+    """
+    while not stop_event.is_set():
+        if random.random() < 0.3:
+            # Иногда — целая "глючная" строка вместо набора случайных символов
+            new_text = f"> {random.choice(ZOOM_GLITCH_FRAGMENTS)}"
+        else:
+            length = random.randint(12, 28)
+            scrambled = ''.join(random.choice(ZOOM_SCRAMBLE_CHARS) for _ in range(length))
+            new_text = f"> {scrambled}"
+        try:
+            await status_msg.edit_text(new_text)
+        except Exception as e:
+            logger.warning(f"Ошибка в глючной анимации Зума: {e}")
+            break
+        await asyncio.sleep(0.4)
+
 
 async def zoom_reply(message, text: str, user_id: int, parse_mode: Optional[str] = None):
     """Отправляет текст как обычно, либо — если у пользователя активен Зум — испорченным."""
@@ -1158,6 +1301,7 @@ async def deactivate_zoom(message: Message, context: ContextTypes.DEFAULT_TYPE, 
         user_grudge_level.pop(user_id, None)
         user_messages_since_grudge_update.pop(user_id, None)
         user_zoom_message_count.pop(user_id, None)
+        user_post_zoom_recovery[user_id] = RECOVERY_COMMANDS_REMAINING
 
         # Добавляем факт о взломе
         add_user_fact(user_id, "Был захвачен Зумом, но система восстановлена.")
@@ -1218,10 +1362,14 @@ async def process_ai_response(message, context, text: str, user_id: int, first_n
         user_message_counters[user_id] = 0
         asyncio.create_task(auto_extract_facts_task(user_id))
 
-    # ===== ЗАПУСКАЕМ АНИМАЦИЮ =====
-    status_msg = await message.reply_text("> Initializing...")
+        # ===== ЗАПУСКАЕМ АНИМАЦИЮ =====
+    zoom_mode = is_zoom_active(user_id)
+    status_msg = await message.reply_text("> [SIGNAL INTERCEPTED]" if zoom_mode else "> Initializing...")
     stop_event = asyncio.Event()
-    anim_task = asyncio.create_task(animate_terminal_status(status_msg, stop_event))
+    if zoom_mode:
+        anim_task = asyncio.create_task(animate_zoom_terminal_status(status_msg, stop_event))
+    else:
+        anim_task = asyncio.create_task(animate_terminal_status(status_msg, stop_event))
 
     # Основной запрос к AI
     await context.bot.send_chat_action(chat_id=chat_id, action='typing')
@@ -1262,16 +1410,11 @@ async def process_ai_response(message, context, text: str, user_id: int, first_n
         asyncio.create_task(animate_zoom_activation(message, context, user_id, chat_id))
 
     # Остальные проверки (Зум, бан и т.д.)
-
-    # Остальные проверки (Зум, бан и т.д.)
     if is_zoom_active(user_id):
         await maybe_send_zoom_video(context.bot, chat_id, user_id)
-    if user_id in user_grudge_ban_until:
-        asyncio.create_task(deactivate_zoom(message, context, user_id))
-    if is_zoom_active(user_id):
         user_zoom_message_count[user_id] = user_zoom_message_count.get(user_id, 0) + 1
         if user_zoom_message_count[user_id] >= ZOOM_DEACTIVATE_THRESHOLD:
-            asyncio.create_task(animate_grudge_ban(message, context, user_id))
+            asyncio.create_task(deactivate_zoom(message, context, user_id))
     # Проверка бана за обиду
     if grudge_level is not None and grudge_level == 3:
         session = SessionLocal()
@@ -1875,7 +2018,9 @@ def notify_on_repeat(command_name: str):
 # ==================== ОБРАБОТЧИКИ КОМАНД ====================
 
 # ---------- /start (с персонализацией) ----------
-@zoom_override("start", block=False)
+@zoom_override("start", block=True)
+@with_command_loading("start")
+@with_recovery_flavor("start")
 @notify_on_repeat("start")
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
@@ -1913,6 +2058,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ---------- /help (HTML) ----------
 @zoom_override("help")
+@with_command_loading("help")
+@with_recovery_flavor("help")
 @notify_on_repeat("help")
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
@@ -1946,10 +2093,12 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     help_text += "\nЕсли и этого недостаточно — обратись к администрации, я не справочная служба.\n"
 
-    await update.message.reply_text(help_text, parse_mode='HTML')
+    await send_terminal_typed(update.message, help_text, parse_mode='HTML')
 
 # ---------- /profile ----------
 @zoom_override("profile")
+@with_command_loading("profile")
+@with_recovery_flavor("profile")
 @notify_on_repeat("profile")
 async def profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
@@ -1982,6 +2131,8 @@ Username: @{user.username or 'не указан'}
 
 # ---------- /setrole ----------
 @zoom_override("setrole")
+@with_command_loading("setrole")
+@with_recovery_flavor("setrole")
 async def setrole(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Позволяет участнику самостоятельно указать роль (имя персонажа). Роль всегда одна — новая заменяет старую."""
     user = update.effective_user
@@ -2017,24 +2168,33 @@ async def setrole(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ---------- /rules ----------
 @zoom_override("rules")
+@with_command_loading("rules")
+@with_recovery_flavor("rules")
 @notify_on_repeat("rules")
 async def rules(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
+    await send_terminal_typed(
+        update.message,
         "Вот правила сообщества. Ознакомься, прежде чем действовать необдуманно:\n"
         "https://telegra.ph/Konstituciya-Omniversa-05-15"
     )
 
 # ---------- /lore ----------
 @zoom_override("lore")
+@with_command_loading("lore")
+@with_recovery_flavor("lore")
 @notify_on_repeat("lore")
 async def lore(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = "Если тебе интересна история — вот события Омниреальности."
+    await send_terminal_typed(update.message, text)
+
     keyboard = [[InlineKeyboardButton("Война Дума", url="https://telegra.ph/Vojna-Duma-07-27")]]
     reply_markup = InlineKeyboardMarkup(keyboard)
-    await update.message.reply_text(text, parse_mode='HTML', reply_markup=reply_markup)
+    await update.message.reply_text("👇", reply_markup=reply_markup)
 
 # ---------- /feedback ----------
 @zoom_override("feedback")
+@with_command_loading("feedback")
+@with_recovery_flavor("feedback")
 async def feedback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     if not user:
@@ -2059,6 +2219,8 @@ async def feedback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ---------- /cancel ----------
 @zoom_override("cancel")
+@with_command_loading("cancel")
+@with_recovery_flavor("cancel")
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear()
     await update.message.reply_text("Операция отменена. Возвращаюсь в обычный режим.")
@@ -2069,6 +2231,8 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 anketa_store = {}
 
 @zoom_override("anketa")
+@with_command_loading("anketa")
+@with_recovery_flavor("anketa")
 @notify_on_repeat("anketa")
 async def anketa(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Начало создания анкеты (сбор частей)"""
@@ -2227,6 +2391,8 @@ async def send_anketa_backup_copy(context: ContextTypes.DEFAULT_TYPE, anketa_id:
         logger.error(f"Не удалось отправить резервную копию анкеты {anketa_id} в BACKUP_ANKET_CHANNEL_ID: {e}")
 
 @zoom_override("send_anketa")
+@with_command_loading("send_anketa")
+@with_recovery_flavor("send_anketa")
 async def send_anketa(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     if not user:
@@ -2384,6 +2550,8 @@ async def send_anketa(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.pop('anketa_items', None)
 
 @zoom_override("anketa_review")
+@with_command_loading("anketa_review")
+@with_recovery_flavor("anketa_review")
 async def anketa_review(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     if not user or (user.id not in DEVELOPER_IDS and user.id not in anketnik_ids):
@@ -2757,6 +2925,74 @@ async def force_grudge(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Следующее любое сообщение этого пользователя боту должно вызвать переход в Зум."
     )
 
+async def reset_zoom_flag(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Дев-команда: сбрасывает флажок has_experienced_zoom у пользователя в БД,
+    чтобы можно было повторно протестировать полноценный захват Зумом на том же юзере.
+
+    Использование:
+      /resetzoomflag                — по себе
+      /resetzoomflag @username      — по юзернейму
+      /resetzoomflag 123456789      — по ID
+      (ответом на сообщение)        — по автору сообщения
+    """
+    user = update.effective_user
+    if not user or not is_developer(user.id):
+        await update.message.reply_text("⛔ Только для разработчиков.")
+        return
+
+    target_id = None
+    target_username = None
+
+    if update.message.reply_to_message and update.message.reply_to_message.from_user:
+        target_id = update.message.reply_to_message.from_user.id
+        target_username = update.message.reply_to_message.from_user.username
+    elif context.args:
+        arg = context.args[0].replace("@", "")
+        if arg.isdigit():
+            target_id = int(arg)
+        else:
+            session = SessionLocal()
+            try:
+                db_user = session.query(User).filter_by(username=arg).first()
+                if db_user:
+                    target_id = db_user.id
+                    target_username = db_user.username
+            finally:
+                session.close()
+            if target_id is None:
+                await update.message.reply_text(f"⚠️ Пользователь '{arg}' не найден в базе.")
+                return
+    else:
+        target_id = user.id
+        target_username = user.username
+
+    session = SessionLocal()
+    try:
+        db_user = session.query(User).filter_by(id=target_id).first()
+        if not db_user:
+            await update.message.reply_text(f"⚠️ Пользователь {target_id} не найден в базе.")
+            return
+        db_user.has_experienced_zoom = False
+        session.commit()
+    finally:
+        session.close()
+
+    # На всякий случай подчищаем и связанные состояния в памяти,
+    # чтобы у юзера был полностью "чистый" старт для теста.
+    user_grudge_level.pop(target_id, None)
+    user_messages_since_grudge_update.pop(target_id, None)
+    user_grudge_high_streak.pop(target_id, None)
+    user_grudge_last_increase_at.pop(target_id, None)
+    user_grudge_msg_counter.pop(target_id, None)
+    user_zoom_message_count.pop(target_id, None)
+    user_grudge_ban_until.pop(target_id, None)
+    user_grudge_ban_comment.pop(target_id, None)
+
+    await update.message.reply_text(
+        f"✅ Флажок has_experienced_zoom сброшен для @{target_username or target_id} ({target_id}). "
+        f"Можно снова тестировать полноценный переход в Зум."
+    )
 
 async def add_zoom_clip(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
@@ -3084,6 +3320,8 @@ async def set_commands(application: Application):
         BotCommand("addzoomclip", "Добавить видео-нарезку Зума (в память)"),
         # === НАЧАЛО ИЗМЕНЕНИЯ: добавить stopzoom ===
         BotCommand("stopzoom", "Принудительно завершить режим Зума у участника"),
+        BotCommand("forcegrudge", "Тест: быстро подвести к переходу в Зум"),
+        BotCommand("resetzoomflag", "Тест: сбросить флажок 'уже пережил Зум'"),
         # === КОНЕЦ ИЗМЕНЕНИЯ ===
     ]
     for dev_id in DEVELOPER_IDS:
@@ -3122,6 +3360,7 @@ def main():
     application.add_handler(CommandHandler("forcefacts", force_extract_facts))
     application.add_handler(CommandHandler("forcezoom", force_zoom))
     application.add_handler(CommandHandler("forcegrudge", force_grudge))
+    application.add_handler(CommandHandler("resetzoomflag", reset_zoom_flag))
     application.add_handler(CommandHandler("addzoomclip", add_zoom_clip))
     application.add_handler(CommandHandler("stopzoom", stopzoom)) 
 
