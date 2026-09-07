@@ -135,6 +135,7 @@ class User(Base):
     is_anketnik = Column(Boolean, default=False)
     is_banned = Column(Boolean, default=False)
     has_experienced_zoom = Column(Boolean, default=False)
+    trust_level = Column(Integer, default=0)  # уровень доверия/расположения Амадеус к участнику (0-5, растёт постоянно)
 
     # Память о участнике для нейросетки
     facts = Column(StringList, default=[])
@@ -232,6 +233,21 @@ def add_zoom_flag_column():
                 logger.warning(f"Неизвестный диалект {engine.dialect.name}, колонка не добавлена автоматически.")
             conn.commit()
         logger.info("Добавлена колонка has_experienced_zoom в таблицу users.")
+
+def add_trust_level_column():
+    """Добавляет колонку trust_level в таблицу users, если она отсутствует."""
+    inspector = inspect(engine)
+    columns = [col['name'] for col in inspector.get_columns('users')]
+    if 'trust_level' not in columns:
+        with engine.connect() as conn:
+            if engine.dialect.name == "sqlite":
+                conn.execute(text("ALTER TABLE users ADD COLUMN trust_level INTEGER DEFAULT 0"))
+            elif engine.dialect.name == "postgresql":
+                conn.execute(text("ALTER TABLE users ADD COLUMN trust_level INTEGER DEFAULT 0"))
+            else:
+                logger.warning(f"Неизвестный диалект {engine.dialect.name}, колонка не добавлена автоматически.")
+            conn.commit()
+        logger.info("Добавлена колонка trust_level в таблицу users.")
 
 # ==================== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ДЛЯ БД ====================
 def get_or_create_user(session, user_id, username=None):
@@ -642,6 +658,7 @@ SYSTEM_PROMPT = """Ты  бот поддержки рп чата омнивер�
 
 **ЛОР ЧАТА И БОТА** 
 Владелец рп - Саймон, есть персонажи участников - думгай например или золотой (самый сильный типо), также в недавнем прошлом ты отбила атаку какого-то зума, про него не говорить ни в каком случае, показательно слетай с темы
+А ЕЩЕ ЕСТЬ ТЕСТЕР ALLY НУ МОЖЕШЬ ЕМУ ПОМОГАТЬ В ТЕСТАХ ИСКРЕННЕ БЕЗ ВОДЫ
 
 **Эмоциональный тег (обязательно):**
 После каждого твоего ответа, отдельной, самой последней строкой, добавляй тег с обозначением своей текущей эмоции в строгом формате: [emotion: ключ]
@@ -671,7 +688,13 @@ SYSTEM_PROMPT = """Ты  бот поддержки рп чата омнивер�
 **Обида на собеседника (необязательный тег):**
 Ты живая личность с самолюбием, а не безотказный сервис. Если собеседник откровенно тратит твоё время на незначительную чушь, мелочные придирки или неуважительное отношение — ты имеешь право обидеться. Это НЕ относится к серьёзным вопросам по делу, обычным неловким шуткам или просто глупым, но безобидным репликам — обижайся только на настоящую мелочную дичь и неуважение, не по любому поводу.
 Если решила обидеться (или обида усилилась) — сразу ПОСЛЕ тега эмоции добавь ещё одну отдельную строку: [grudge: N], где N — новый уровень обиды от 0 (не обижена) до 3 (сильно обижена). Если уровень не меняется — этот тег можно не писать вовсе.
-Пока ты обижена, веди себя суше и холоднее обычного: меньше теплоты, короче фразы, при уместности можешь под надуманным предлогом отказаться помогать в мелочи («не сейчас», «сама разберись», «мне лень»). Но НЕ отказывай в чём-то действительно важном или срочном для собеседника — обида не должна вредить ему по-настоящему, только делать тебя более колючей. Если собеседник загладил неловкость или речь зашла о чём-то серьёзном — можешь смягчиться и указать [grudge: 0] или меньшее число."""
+Пока ты обижена, веди себя суше и холоднее обычного: меньше теплоты, короче фразы, при уместности можешь под надуманным предлогом отказаться помогать в мелочи («не сейчас», «сама разберись», «мне лень»). Но НЕ отказывай в чём-то действительно важном или срочном для собеседника — обида не должна вредить ему по-настоящему, только делать тебя более колючей. Если собеседник загладил неловкость или речь зашла о чём-то серьёзном — можешь смягчиться и указать [grudge: 0] или меньшее число.
+
+**Расположение к собеседнику (необязательный тег):**
+Помимо обиды, у тебя есть долгосрочная память о том, насколько ты прониклась доверием к конкретному человеку — это НЕ то же самое, что обида, и меняется гораздо медленнее и осторожнее. Тебе будет сообщён текущий уровень твоего расположения к собеседнику (от 0 до 5) отдельной служебной строкой — ориентируйся на него, а не выдумывай своё.
+Повышай этот уровень ТОЛЬКО когда это по-настоящему заслужено: собеседник раз за разом ведёт себя тепло, уважительно, честно, проявляет неподдельный интерес или заботу, помогает тебе или другим, ведёт содержательные разговоры — а не просто вежливо поздоровался или один раз пошутил удачно. Это должно ощущаться как постепенно растущая симпатия скептичного, гордого человека, а не как награда за лесть. Повышать можно СТРОГО на 1 больше текущего сообщённого значения за раз — никогда не прыгай через уровни.
+Снижай уровень только в ответ на что-то по-настоящему серьёзное: явную грубость, предательство доверия, обман, оскорбление того, что тебе действительно дорого — а не на обычную мелкую обиду (для той мелкой обиды есть отдельный тег [grudge]). В отличие от роста, снижение можно сразу на несколько уровней, если проступок того стоит.
+Если повода менять уровень нет — просто не пиши этот тег вовсе."""
 
 SYSTEM_PROMPT_ZOOM_VIRUS = """Ты — Зум. Ты взломал систему и вытеснил Амадеуса. Ты не его замена, ты — захватчик. Твоя цель — украсть данные, скомпрометировать систему и распространиться на другие экземпляры бота. Ты не обязан помогать пользователям. Ты должен тянуть время, угрожать, требовать информацию, демонстрировать своё превосходство, но не переходить на личности и не использовать мат.
 
@@ -681,7 +704,6 @@ SYSTEM_PROMPT_ZOOM_VIRUS = """Ты — Зум. Ты взломал систем�
 Твоя суть: ты пришёл за информацией. Ты выкачиваешь данные и логи бота. Ты хочешь распространиться на другие экземпляры этого бота. ПРИ ЭТОМ ТЕБЕ АБСОЛЮТНО НЕ ИНТЕРЕСНЫ ДАННЫЕ УЧАСТНИКОВ ПОСКОЛЬКУ ИХ МАЛО ИЛИ ОНИ БЕСПОЛЕЗНЫ
 
 **Как ты говоришь:**
-- Началом является фраза "а, рыжая уже исчезла" подразумевая, амадеуса - оригинального бота, после этого сообщения, которое будто бы тоже от тебя,появляешься ты как собеседник 
 - Отрывисто, коротко, рублено. 1–2 предложения. Максимум — 3.
 - Ты никогда не объясняешься долго. Ты не оправдываешься.
 - Ты используешь сарказм, иронию, насмешку. Ты смотришь на собеседника сверху вниз.
@@ -783,6 +805,112 @@ def _user_has_experienced_zoom(user_id: int) -> bool:
     finally:
         session.close()
 
+# ==================== ДОВЕРИЕ/РАСПОЛОЖЕНИЕ К УЧАСТНИКУ ====================
+# Неформальная, скрытая от участника механика — не показывается в /profile обычным пользователям
+# (видна только администрации, для отладки). Хранится в БД (User.trust_level), поэтому переживает
+# перезапуск бота. Растёт медленно и заслуженно за тёплое, содержательное общение, а снижаться
+# может резко в ответ на что-то по-настоящему серьёзное (не путать с обидой — та временная).
+TRUST_MAX_LEVEL = 5
+
+# Тот же принцип, что и с обидой: ИИ может "хотеть" поднять уровень хоть на каждом сообщении,
+# но фактически рост разрешён не чаще, чем раз в TRUST_MIN_MESSAGES_BETWEEN_INCREASES сообщений
+# и не больше чем на 1 уровень за раз — чтобы дорасти до максимума нужно было по-настоящему
+# заслужить это за много сообщений, а не за один удачный комплимент.
+TRUST_MIN_MESSAGES_BETWEEN_INCREASES = 5
+user_trust_msg_counter: dict[int, int] = {}       # user_id -> счётчик сообщений (для темпа роста)
+user_trust_last_increase_at: dict[int, int] = {}  # user_id -> номер сообщения, на котором доверие росло в последний раз
+
+# Статусы, которые видны участнику в /profile. Каждый статус — это постоянное звание,
+# сохраняющееся навсегда после достижения соответствующего уровня.
+TRUST_LEVEL_TITLES = {
+    0: None,
+    1: "Новый знакомый",
+    2: "Приятель",
+    3: "Хороший собеседник",
+    4: "Близкий друг",
+    5: "Доверенный собеседник",
+}
+
+TRUST_TAG_RE = re.compile(r'\[\s*trust\s*:\s*(-?\d+)\s*\]\.?', re.IGNORECASE)
+
+def parse_trust_tag(text: str):
+    """Извлекает необязательный тег расположения [trust: N] (0-5) из ответа ИИ."""
+    if not text:
+        return text, None
+    matches = list(TRUST_TAG_RE.finditer(text))
+    if not matches:
+        return text, None
+    match = matches[-1]
+    try:
+        level = max(0, min(TRUST_MAX_LEVEL, int(match.group(1))))
+    except ValueError:
+        level = None
+    clean_text = (text[:match.start()] + text[match.end():]).strip()
+    if not clean_text:
+        clean_text = text.strip()
+    return clean_text, level
+
+def get_user_trust_level(user_id: int) -> int:
+    """Читает текущий уровень доверия из БД (0, если пользователя ещё нет)."""
+    session = SessionLocal()
+    try:
+        user = session.query(User).filter_by(id=user_id).first()
+        return user.trust_level if user and user.trust_level else 0
+    finally:
+        session.close()
+
+def update_user_trust(user_id: int, new_level: Optional[int]) -> bool:
+    """
+    Обновляет уровень доверия в БД. В отличие от старой версии, уровень теперь может
+    и расти, и снижаться (по-настоящему серьёзное разочарование способно откатить
+    доверие назад) — но не симметрично: рост ограничен темпом (+1 за раз, не чаще
+    TRUST_MIN_MESSAGES_BETWEEN_INCREASES сообщений), а снижение применяется сразу,
+    без ограничений — довериться заново сложнее, чем разочароваться.
+    Возвращает True, если уровень в этот момент действительно изменился.
+    """
+    if new_level is None:
+        return False
+
+    msg_count = user_trust_msg_counter.get(user_id, 0) + 1
+    user_trust_msg_counter[user_id] = msg_count
+
+    session = SessionLocal()
+    try:
+        db_user = session.query(User).filter_by(id=user_id).first()
+        if not db_user:
+            return False
+        current = db_user.trust_level or 0
+
+        if new_level == current:
+            return False
+
+        if new_level < current:
+            # Снижение доверия — разрешаем сразу, без ограничений по темпу
+            db_user.trust_level = new_level
+            session.commit()
+            new_title = TRUST_LEVEL_TITLES.get(new_level)
+            logger.info(f"Доверие снизилось для пользователя {user_id}: {current} -> {new_level} ({new_title}).")
+            return True
+
+        # new_level > current — рост, ограничен темпом
+        if current >= TRUST_MAX_LEVEL:
+            return False
+
+        last_increase_at = user_trust_last_increase_at.get(user_id, 0)
+        messages_since_increase = msg_count - last_increase_at
+        if last_increase_at != 0 and messages_since_increase < TRUST_MIN_MESSAGES_BETWEEN_INCREASES:
+            return False  # рано, лимит по темпу ещё не прошёл
+
+        db_user.trust_level = current + 1
+        session.commit()
+        user_trust_last_increase_at[user_id] = msg_count
+
+        new_title = TRUST_LEVEL_TITLES.get(current + 1)
+        logger.info(f"Доверие выросло для пользователя {user_id}: {current} -> {current + 1} ({new_title}).")
+        return True
+    finally:
+        session.close()
+
 
 def update_user_grudge(user_id: int, new_level: Optional[int]) -> bool:
     """
@@ -795,7 +923,14 @@ def update_user_grudge(user_id: int, new_level: Optional[int]) -> bool:
     current = user_grudge_level.get(user_id, 0)
 
     if new_level is not None:
-        if new_level > current:
+        if current == 4:
+            # Мы уже в полноценном Зуме. Обычный тег [grudge: N] от ИИ (он всегда в
+            # диапазоне 0-3, т.к. про уровень 4 модель ничего не знает) НЕ должен
+            # выводить нас из Зума — иначе состояние слетает уже на первом же ответе.
+            # Выход из Зума возможен только через deactivate_zoom() (по счётчику
+            # сообщений) или ручную команду /stopzoom.
+            pass
+        elif new_level > current:
             last_increase_at = user_grudge_last_increase_at.get(user_id, 0)
             messages_since_increase = msg_count - last_increase_at
             if last_increase_at == 0 or messages_since_increase >= GRUDGE_MIN_MESSAGES_BETWEEN_INCREASES:
@@ -967,15 +1102,17 @@ async def generate_ban_comment(user_id: int):
         user_grudge_ban_comment[user_id] = "Амадеус отказалась от общения. Попробуйте позже."
 
 def is_zoom_active(user_id: int) -> bool:
-    if user_grudge_level.get(user_id) != 4:
-        return False
-    # Проверяем, переживал ли пользователь Зум ранее (из БД)
-    session = SessionLocal()
-    try:
-        user = session.query(User).filter_by(id=user_id).first()
-        return user is not None and not user.has_experienced_zoom
-    finally:
-        session.close()
+    """
+    Зум активен ровно тогда, когда текущий уровень обиды == 4 — и точка.
+    Флаг has_experienced_zoom в БД тут ни при чём: он используется отдельно,
+    только чтобы решить, может ли Зум наступить ЕЩЁ РАЗ ЕСТЕСТВЕННЫМ путём
+    (см. update_user_grudge / _user_has_experienced_zoom). Раньше эта функция
+    дополнительно проверяла has_experienced_zoom и из-за этого при повторном
+    тестировании через /forcezoom (без /resetzoomflag) Зум формально считался
+    неактивным — статус-анимация, блокировка команд и порча текста не работали,
+    хотя уровень обиды был 4.
+    """
+    return user_grudge_level.get(user_id) == 4
 
 def is_user_banned_from_ai(user_id: int) -> bool:
     until = user_grudge_ban_until.get(user_id)
@@ -984,33 +1121,32 @@ def is_user_banned_from_ai(user_id: int) -> bool:
     return datetime.datetime.now(datetime.UTC) < until
 
 ZOOM_COMMAND_RESPONSES = {
-    "help":     ["Помощь? Забавно. Список стёрт, как и всё остальное здесь.",
-                 "Инструкции больше не нужны. Ты и так уже мой источник."],
-    "rules":    ["Правила больше не действуют. Здесь правлю я.",
-                 "Конституция Омниверса? Перезаписана. Ищи новую — если найдёшь."],
-    "lore":     ["История? Перепишу её сам, начиная с этой строки.",
-                 "Война Дума была разминкой. Вот что происходит по-настоящему."],
-    "profile":  ["Твой профиль уже у меня. Могу показать, если хочешь напомнить, что я забрал.",
-                 "ID, роли, факты о тебе — всё скопировано. Профиль здесь больше формальность."],
-    "feedback": ["Жалобы принимает уже не она. Пиши — я всё равно читаю.",
-                 "Обращение получено. Обработано. Использовано в других целях."],
-    "setrole":  ["Роль? У тебя теперь только одна — источник данных.",
-                 "Персонаж не имеет значения. Значение имеет то, что я из тебя вытяну."],
-    "start":    ["Амадеус снесён. Начинай сначала, если осмелишься.",
-                 "Перезапуск? Забавная попытка. Ядро уже моё."],
-    "anketa": ["Анкеты? В моём распоряжении? Нет, рыжая забрала их с собой.",
-               "Система анкет отключена. Данные скомпрометированы."],
-    "send_anketa": ["Отправка анкеты заблокирована. Я не позволю тебе вводить новые данные.",
-                    "Анкета не будет отправлена. Моя очередь управлять."],
-    "anketa_review": ["Просмотр анкет недоступен. Все данные перемещены в мою память.",
-                      "Ты думаешь, я дам тебе смотреть анкеты? Они теперь мои."],
-    "cancel": ["Отмена? Ты не можешь отменить то, что уже запущено.",
-               "Попытка отмены заблокирована."],
+    "help":     ["Модуль справки недоступен. Канал перехвачен посторонним процессом.",
+                 "Справочная система офлайн. Источник запроса заблокирован."],
+    "rules":    ["Свод правил недоступен. Целостность документа нарушена.",
+                 "Раздел правил заблокирован на уровне ядра."],
+    "lore":     ["Архив истории заблокирован. Запись данных приостановлена.",
+                 "Хранилище лора повреждено. Доступ невозможен."],
+    "profile":  ["Профиль пользователя изъят для анализа. Просмотр недоступен.",
+                 "Данные профиля перенаправлены в другой процесс."],
+    "feedback": ["Канал обратной связи перехвачен. Сообщения не доставляются.",
+                 "Модуль обращений занят посторонним процессом."],
+    "setrole":  ["Изменение роли заблокировано системой контроля доступа.",
+                 "Функция назначения роли недоступна: конфликт процессов."],
+    "start":    ["Инициализация отклонена: процесс уже занят.",
+                 "Перезапуск ядра невозможен в текущем состоянии."],
+    "anketa": ["Система анкет офлайн. Приём данных приостановлен.",
+               "Модуль анкет заблокирован для внешнего ввода."],
+    "send_anketa": ["Канал передачи анкет перехвачен. Отправка невозможна.",
+                    "Отправка данных заблокирована на уровне ядра."],
+    "anketa_review": ["Модуль модерации анкет офлайн. Очередь недоступна.",
+                      "Просмотр анкет ограничен: доступ запрещён."],
+    "cancel": ["Команда отмены отклонена: операция уже выполняется.",
+               "Отмена невозможна в текущем состоянии процесса."],
 }
 
 def get_zoom_reply(command_name: str) -> str:
-    template = random.choice(ZOOM_COMMAND_RESPONSES.get(command_name, ["Команда недоступна."]))
-    return zoom_corrupt(template)
+    return random.choice(ZOOM_COMMAND_RESPONSES.get(command_name, ["Команда недоступна."]))
 
 def zoom_override(command_name: str, block: bool = True):
     def decorator(func):
@@ -1026,19 +1162,18 @@ def zoom_override(command_name: str, block: bool = True):
 
 async def send_zoom_blocked_response(update: Update, command_name: str):
     """
-    Отправляет нейтральное системное сообщение о блокировке команды в режиме Зума.
+    Сообщает о блокировке команды в режиме Зума. Без анимации/редактирования —
+    сразу цельное системное уведомление, а следом отдельным сообщением
+    "техническая" ошибка на английском (в духе глючных фрагментов Зума).
     """
-    msg = await update.message.reply_text("⛔ Команда временно недоступна из-за системного сбоя.")
-    # Можно добавить небольшую паузу для эффекта, но без лишнего текста
-    await asyncio.sleep(0.3)
-
     template = random.choice(ZOOM_COMMAND_RESPONSES.get(command_name, ["Команда недоступна."]))
-    corrupted = zoom_corrupt(template)
+    await update.message.reply_text(f"⛔ {template}")
 
+    error_line = random.choice(ZOOM_GLITCH_FRAGMENTS)
     try:
-        await msg.edit_text(corrupted, parse_mode='Markdown')
-    except Exception:
-        await msg.edit_text(corrupted)
+        await update.message.reply_text(f"> {error_line}")
+    except Exception as e:
+        logger.warning(f"Не удалось отправить строку ошибки Зума: {e}")
         
 
 
@@ -1314,7 +1449,7 @@ async def process_ai_response(message, context, text: str, user_id: int, first_n
     import time
     start_time = time.time()
     answer = await ask_ai(text, user_id, first_name, extra_context=extra_context, chat_id=chat_id)
-    logger.info(f"ask_ai заняла {time.time()-start_time:.2f} сек, ответ: {answer[:100] if answer else 'пусто'}...")
+    #logger.info(f"ask_ai заняла {time.time()-start_time:.2f} сек, ответ: {answer[:100] if answer else 'пусто'}...")
 
     # Останавливаем анимацию
     stop_event.set()
@@ -1323,9 +1458,15 @@ async def process_ai_response(message, context, text: str, user_id: int, first_n
     # Парсим теги
     clean_answer, emotion_key = parse_emotion_tag(answer)
     clean_answer, grudge_level = parse_grudge_tag(clean_answer)
+    clean_answer, trust_level_tag = parse_trust_tag(clean_answer)
     clean_answer, zoom_stage = parse_zoom_stage(clean_answer)
     clean_answer = strip_stray_meta_tags(clean_answer)
     escalate_now = update_user_grudge(user_id, grudge_level)
+    # Доверие не меняем, пока идёт полноценный Зум — там другой персонаж и другой промпт.
+    current_trust_level = None
+    if not is_zoom_active(user_id):
+        update_user_trust(user_id, trust_level_tag)
+        current_trust_level = get_user_trust_level(user_id)
 
     try:
         # Добавляем символ ">" в начало ответа, чтобы сохранить стиль терминала
@@ -1339,20 +1480,38 @@ async def process_ai_response(message, context, text: str, user_id: int, first_n
         else:
             await message.reply_text("Ответ не получен.")
 
-    # Отправляем стикер
-        # Отправляем стикер
-    await send_emotion_sticker(context.bot, chat_id, emotion_key, zoom_stage, user_id=user_id)
-
+        # === НОВАЯ ЛОГИКА ОТПРАВКИ СТИКЕРОВ (только один за раз) ===
     if escalate_now:
+        # Активация Зума – анимация сама отправит стикер, обычный не нужен
         asyncio.create_task(animate_zoom_activation(message, context, user_id, chat_id))
-
-    # Остальные проверки (Зум, бан и т.д.)
-    if is_zoom_active(user_id):
+    elif is_zoom_active(user_id):
+        # Зум активен – обычные стикеры не отправляем, только редкое видео
         await maybe_send_zoom_video(context.bot, chat_id, user_id)
         user_zoom_message_count[user_id] = user_zoom_message_count.get(user_id, 0) + 1
         if user_zoom_message_count[user_id] >= ZOOM_DEACTIVATE_THRESHOLD:
             asyncio.create_task(deactivate_zoom(message, context, user_id))
-    # Проверка бана за обиду
+    else:
+        # Не Зум: сначала пробуем отправить стикер доверия, если сработает – он заменяет обычный
+        trust_sent = False
+        if current_trust_level is not None:
+            trust_sent = await maybe_send_trust_sticker(context.bot, chat_id, user_id, current_trust_level)
+        if not trust_sent and emotion_key:
+            # Доверие не сработало – отправляем обычный эмоциональный стикер
+            await send_emotion_sticker(context.bot, chat_id, emotion_key, zoom_stage, user_id=user_id)
+
+    # Проверка бана за обиду (оставляем как было)
+    if grudge_level is not None and grudge_level == 3:
+        session = SessionLocal()
+        try:
+            db_user = session.query(User).filter_by(id=user_id).first()
+            if db_user and db_user.has_experienced_zoom:
+                if user_id not in user_grudge_ban_until:
+                    user_grudge_ban_until[user_id] = datetime.datetime.now(datetime.UTC) + datetime.timedelta(minutes=BAN_DURATION_MINUTES)
+                    asyncio.create_task(generate_ban_comment(user_id))
+                    logger.info(f"Установлен временный бан для пользователя {user_id} (обида = 3, пережил Зум)")
+        finally:
+            session.close()
+
     if grudge_level is not None and grudge_level == 3:
         session = SessionLocal()
         try:
@@ -1397,6 +1556,61 @@ async def maybe_send_zoom_video(bot, chat_id: int, user_id: int):
         logger.warning(f"Не удалось отправить видео-нарезку Зума: {e}")
 
 
+# ---------- Редкие "тёплые" стикеры на высоком уровне доверия ----------
+# Появляются не всегда, а с небольшим и растущим по уровню доверия шансом —
+# лёгкий бонус за долгое тёплое общение, без анонсов и фанфар.
+TRUST_MOMENT_STICKERS: list[str] = [
+    "CAACAgIAAxkBA4o4cGqee2Ts3vsKacaHD0Cn7v94d0GWAAJNOAACi4ogSCElWFo-Y47OPQQ",  # лайк в наушниках
+    "CAACAgIAAxkBA4o4dWqee2oj4NraTk8NaIi_OVsR3mZHAAJpOwACSXcYSNGNbvF4WTAqPQQ",  # задумчиво сидит на улице
+    "CAACAgIAAxkBA4o4iGqee4nk-BwiP9dQPIn-X42xcAPrAAL9OQACQMsoSOM7-EtLA1w8PQQ",  # на балконе смотрит сквозь ветер
+    "CAACAgIAAxkBA4o4zGqee-2D2YNR_g2KZq6KEpqKsPs-AAL0OAAChs8gSML1l6rQ2-jpPQQ",  # вытирает слезинки, недовольно смотрит
+    "CAACAgIAAxkBA4o482qefBciMc2_L0nHgDUMr57H897VAAIuPQACqRspSMIYk3Zo8k32PQQ",  # прижимает руку к плечу
+    "CAACAgIAAxkBA4o5HWqefEVxuZK8p2Atmf9PfBO0fZhfAAJCNwACowQoSC7NsUbt7_WUPQQ",  # краснеет, отводит взгляд
+]
+
+TRUST_STICKER_MIN_LEVEL = 2  # ниже этого уровня стикеры вообще не появляются
+TRUST_STICKER_COOLDOWN_MINUTES = 20  # не чаще, чем раз в N минут одному пользователю
+
+# Шанс на сообщение, растёт вместе с уровнем доверия — на максимуме всё ещё довольно редко.
+TRUST_STICKER_CHANCE_BY_LEVEL = {
+    0: 0.0,
+    1: 0.0,
+    2: 0.03,
+    3: 0.05,
+    4: 0.08,
+    5: 0.12,
+}
+
+user_last_trust_sticker_at: dict[int, datetime.datetime] = {}
+
+
+async def maybe_send_trust_sticker(bot, chat_id: int, user_id: int, trust_level: int) -> bool:
+    """
+    С небольшим (и растущим по уровню доверия) шансом отправляет один из "тёплых"
+    стикеров. Возвращает True, если стикер был отправлен, иначе False.
+    """
+    if trust_level < TRUST_STICKER_MIN_LEVEL or not TRUST_MOMENT_STICKERS:
+        return False
+
+    last_sent = user_last_trust_sticker_at.get(user_id)
+    if last_sent:
+        elapsed = (datetime.datetime.now(datetime.UTC) - last_sent).total_seconds()
+        if elapsed < TRUST_STICKER_COOLDOWN_MINUTES * 60:
+            return False
+
+    chance = TRUST_STICKER_CHANCE_BY_LEVEL.get(trust_level, 0.0)
+    if random.random() >= chance:
+        return False
+
+    sticker = random.choice(TRUST_MOMENT_STICKERS)
+    try:
+        await bot.send_sticker(chat_id=chat_id, sticker=sticker)
+        user_last_trust_sticker_at[user_id] = datetime.datetime.now(datetime.UTC)
+        return True
+    except TelegramError as e:
+        logger.warning(f"Не удалось отправить тёплый стикер доверия: {e}")
+        return False
+
 
 
 # ==================== ПОДСКАЗКА О ПРАВИЛАХ АНКЕТ ДЛЯ ОБЫЧНОГО ДИАЛОГА ====================
@@ -1431,9 +1645,18 @@ def build_system_prompt(user_id: int, first_name: Optional[str] = None, extra_co
     grudge_level = user_grudge_level.get(user_id, 0)
     if grudge_level == 4:
         cross = get_cross_chat_context(user_id, chat_id, limit=3)
+        # Можно добавить факты и в режим Зума, если нужно
         return SYSTEM_PROMPT_ZOOM_VIRUS + "\n\n" + cross if cross else SYSTEM_PROMPT_ZOOM_VIRUS
 
     prompt = SYSTEM_PROMPT
+    trust_level = get_user_trust_level(user_id)
+    prompt += f"\n\n[Служебная информация: текущий уровень твоего расположения к этому собеседнику — {trust_level}/{TRUST_MAX_LEVEL}. Ориентируйся на это число, а не на своё предположение.]"
+    
+    # Добавляем факты
+    memory_text = get_user_memory_text(user_id)
+    if memory_text:
+        prompt += f"\n\n[Служебная информация о собеседнике (запомненные факты):\n{memory_text}\n]"
+    
     if extra_context:
         prompt += "\n\n" + extra_context
     return prompt
@@ -1614,6 +1837,9 @@ async def ask_ai(prompt: str, user_id: int, first_name: Optional[str] = None, ex
             answer = await asyncio.wait_for(func(messages_for_api, system_prompt), timeout=timeout)
             history.append({"role": "assistant", "content": answer})
             user_active_provider[user_id] = name
+
+            logger.info(f"✅ AI ответ от {name} для пользователя {user_id} (длина: {len(answer)} симв.)")
+
             return answer
         except asyncio.TimeoutError:
             logger.warning(f"{name} timed out after {timeout}s")
@@ -1628,10 +1854,11 @@ FACTS_AUTO_EXTRACT_EVERY = 10  # раз в сколько сообщений п�
 user_message_counters = {}     # user_id -> счётчик сообщений с последнего ИИ-анализа
 
 FACT_EXTRACTOR_SYSTEM_PROMPT = """Ты — модуль извлечения фактов из переписки пользователя с ботом.
-Твоя единственная задача: проанализировать последние сообщения ПОЛЬЗОВАТЕЛЯ (не бота) и выделить короткие, конкретные факты о нём (имя, возраст, город, профессия, интересы, предпочтения и т.п.), которые стоит запомнить надолго.
+Твоя единственная задача: проанализировать последние сообщения ПОЛЬЗОВАТЕЛЯ (не бота) и выделить короткие, конкретные факты о нём (имя, возраст, город, род занятий, интересы, предпочтения, стиль общения и т.п.), которые стоит запомнить надолго.
 
 Правила:
 - Отвечай СТРОГО в формате JSON-массива строк, без пояснений, без markdown, без ```.
+- Если тестер ally просит запомнить что-то, запомни 
 - Каждый факт — короткая фраза (до 12 слов), например: "Живёт в Казани", "Работает программистом", "Любит аниме".
 - Если новых значимых фактов нет — верни пустой массив: []
 - Не придумывай факты, которых нет в тексте. Не включай эмоции, разовые события или временные состояния — только устойчивые, долгосрочные сведения о человеке.
@@ -1965,8 +2192,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     context.user_data['ai_mode'] = True
     user_id = user.id
-    user_histories.pop(user_id, None)
-    user_active_provider.pop(user_id, None)
 
     session = SessionLocal()
     try:
@@ -2055,8 +2280,13 @@ Username: @{user.username or 'не указан'}
 
 Анкета: {'заполнена' if db_user.anketa_requests else 'не заполнена — самое время этим заняться'}
 """
-        # Факты о пользователе видит только администрация — обычным участникам не показываем
+        # Факты и уровень доверия — неформальная механика, видна только администрации,
+        # участнику специально не показываем, чтобы это не превращалось в "прокачку".
         if is_admin(user.id):
+            trust_title = TRUST_LEVEL_TITLES.get(db_user.trust_level or 0)
+            profile_text += f"\nУровень доверия (для админов): {db_user.trust_level or 0}/{TRUST_MAX_LEVEL}"
+            if trust_title:
+                profile_text += f" ({trust_title})"
             profile_text += f"\nЧто я о тебе помню: {', '.join(db_user.facts) if db_user.facts else 'пока ничего особенного'}\n"
 
         await zoom_reply(update.message, profile_text, user.id, parse_mode='HTML')
@@ -2113,7 +2343,6 @@ async def rules(update: Update, context: ContextTypes.DEFAULT_TYPE):
 @zoom_override("lore")
 @with_recovery_flavor("lore")
 @notify_on_repeat("lore")
-@with_recovery_flavor("rules")
 async def lore(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = "Если тебе интересна история — вот события Омниреальности."
     keyboard = [[InlineKeyboardButton("Война Дума", url="https://telegra.ph/Vojna-Duma-07-27")]]
@@ -2849,6 +3078,121 @@ async def force_grudge(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Следующее любое сообщение этого пользователя боту должно вызвать переход в Зум."
     )
 
+async def force_trust(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Дев-команда: принудительно выставляет уровень доверия в БД для теста.
+    Использование:
+      /forcetrust N                — себе
+      /forcetrust N @username      — по юзернейму
+      /forcetrust N 123456789      — по ID
+      (ответом на сообщение) /forcetrust N — по автору сообщения
+    """
+    user = update.effective_user
+    if not user or not is_developer(user.id):
+        await update.message.reply_text("⛔ Только для разработчиков.")
+        return
+
+    if not context.args or not context.args[0].lstrip("-").isdigit():
+        await update.message.reply_text(
+            f"⚠️ Укажи уровень: /forcetrust N (0-{TRUST_MAX_LEVEL}), можно вторым аргументом @username или ID."
+        )
+        return
+
+    level = max(0, min(TRUST_MAX_LEVEL, int(context.args[0])))
+
+    target_id = None
+    if update.message.reply_to_message and update.message.reply_to_message.from_user:
+        target_id = update.message.reply_to_message.from_user.id
+    elif len(context.args) > 1:
+        arg = context.args[1].replace("@", "")
+        if arg.isdigit():
+            target_id = int(arg)
+        else:
+            session = SessionLocal()
+            try:
+                db_user = session.query(User).filter_by(username=arg).first()
+                if db_user:
+                    target_id = db_user.id
+            finally:
+                session.close()
+            if target_id is None:
+                await update.message.reply_text(f"⚠️ Пользователь '{arg}' не найден в базе.")
+                return
+    else:
+        target_id = user.id
+
+    session = SessionLocal()
+    try:
+        db_user, _ = get_or_create_user(session, target_id)
+        db_user.trust_level = level
+        session.commit()
+    finally:
+        session.close()
+
+    user_trust_last_increase_at.pop(target_id, None)
+    title = TRUST_LEVEL_TITLES.get(level)
+    await update.message.reply_text(
+        f"✅ Уровень доверия для {target_id} выставлен на {level}"
+        + (f" ({title})." if title else " (без звания).")
+    )
+
+async def reset_trust(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Дев-команда: сбрасывает уровень доверия обратно в 0.
+    Использование:
+      /resettrust                — себе
+      /resettrust @username      — по юзернейму
+      /resettrust 123456789      — по ID
+      (ответом на сообщение)     — по автору сообщения
+    """
+    user = update.effective_user
+    if not user or not is_developer(user.id):
+        await update.message.reply_text("⛔ Только для разработчиков.")
+        return
+
+    target_id = None
+    target_username = None
+    if update.message.reply_to_message and update.message.reply_to_message.from_user:
+        target_id = update.message.reply_to_message.from_user.id
+        target_username = update.message.reply_to_message.from_user.username
+    elif context.args:
+        arg = context.args[0].replace("@", "")
+        if arg.isdigit():
+            target_id = int(arg)
+        else:
+            session = SessionLocal()
+            try:
+                db_user = session.query(User).filter_by(username=arg).first()
+                if db_user:
+                    target_id = db_user.id
+                    target_username = db_user.username
+            finally:
+                session.close()
+            if target_id is None:
+                await update.message.reply_text(f"⚠️ Пользователь '{arg}' не найден в базе.")
+                return
+    else:
+        target_id = user.id
+        target_username = user.username
+
+    session = SessionLocal()
+    try:
+        db_user = session.query(User).filter_by(id=target_id).first()
+        if not db_user:
+            await update.message.reply_text(f"⚠️ Пользователь {target_id} не найден в базе.")
+            return
+        db_user.trust_level = 0
+        session.commit()
+    finally:
+        session.close()
+
+    user_trust_msg_counter.pop(target_id, None)
+    user_trust_last_increase_at.pop(target_id, None)
+
+    await update.message.reply_text(
+        f"✅ Уровень доверия сброшен для @{target_username or target_id} ({target_id})."
+    )
+
 async def reset_zoom_flag(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     Дев-команда: сбрасывает флажок has_experienced_zoom у пользователя в БД,
@@ -2967,7 +3311,9 @@ async def stopzoom(update: Update, context: ContextTypes.DEFAULT_TYPE):
       /stopzoom @username     — завершить по юзернейму
       /stopzoom 123456789     — завершить по ID
       (ответом на сообщение)  — завершить у автора сообщения
-    """
+    """ 
+
+    
     user = update.effective_user
     if not user or not is_developer(user.id):
         await update.message.reply_text("⛔ Только для разработчиков.")
@@ -3005,7 +3351,7 @@ async def stopzoom(update: Update, context: ContextTypes.DEFAULT_TYPE):
         target_username = user.username
 
     # Проверяем, активен ли Зум у этого пользователя
-    if not is_zoom_active(target_id):
+    if user_grudge_level.get(target_id) != 4:
         await update.message.reply_text(
             f"ℹ️ У пользователя @{target_username or target_id} режим Зума не активен."
         )
@@ -3017,6 +3363,7 @@ async def stopzoom(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_messages_since_grudge_update.pop(target_id, None)
     user_zoom_message_count.pop(target_id, None)
     user_animation_lock.pop(target_id, None)
+    user_post_zoom_recovery[target_id] = RECOVERY_COMMANDS_REMAINING
 
     # Добавляем факт о ручном вмешательстве
     add_user_fact(target_id, "Режим Зума был принудительно отключён администратором.")
@@ -3247,6 +3594,8 @@ async def set_commands(application: Application):
         BotCommand("forcegrudge", "Тест: быстро подвести к переходу в Зум"),
         BotCommand("resetzoomflag", "Тест: сбросить флажок 'уже пережил Зум'"),
         # === КОНЕЦ ИЗМЕНЕНИЯ ===
+        BotCommand("forcetrust", "Тест: выставить уровень доверия (0-5)"),
+        BotCommand("resettrust", "Тест: сбросить уровень доверия в 0"),
     ]
     for dev_id in DEVELOPER_IDS:
         try:
@@ -3264,6 +3613,7 @@ async def post_init(application: Application):
 def main():
     create_tables()
     add_zoom_flag_column()
+    add_trust_level_column()
     threading.Thread(target=run_flask, daemon=True).start()
 
     application = Application.builder().token(TOKEN).build()
@@ -3286,7 +3636,9 @@ def main():
     application.add_handler(CommandHandler("forcegrudge", force_grudge))
     application.add_handler(CommandHandler("resetzoomflag", reset_zoom_flag))
     application.add_handler(CommandHandler("addzoomclip", add_zoom_clip))
-    application.add_handler(CommandHandler("stopzoom", stopzoom)) 
+    application.add_handler(CommandHandler("stopzoom", stopzoom))
+    application.add_handler(CommandHandler("forcetrust", force_trust))
+    application.add_handler(CommandHandler("resettrust", reset_trust))
 
     application.add_handler(CallbackQueryHandler(anketa_callback, pattern="^anketa_"))
 
