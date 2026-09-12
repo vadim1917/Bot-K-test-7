@@ -2353,6 +2353,10 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 /cancel — отменить текущее заполнение анкеты
 /send_anketa — отправить собранную анкету на модерацию (после /anketa)
 /anketa_review — просмотр анкет на модерацию (для анкетников)
+
+<b>Ролевая игра (RP):</b>
+/rp_status — показать текущий статус RP
+/rp_stop — принудительно завершить RP
 """
 
     if user and is_developer(user.id):
@@ -2361,10 +2365,6 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 /addanketnik — назначить анкетника
 /resetcd — обнулить кулдаун на отправку анкеты у участника (доступно и модераторам)
 /forcefacts — принудительно запустить извлечение фактов ИИ
-
-<b>Ролевая игра (RP):</b>
-/rp_status — показать текущий статус RP
-/rp_stop — принудительно завершить RP
 """
 
     help_text += "\nЕсли и этого недостаточно — обратись к администрации, я не справочная служба.\n"
@@ -2377,9 +2377,6 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def rp_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     if not user:
-        return
-    if not is_developer(user.id):
-        await update.message.reply_text("Эта команда доступна только разработчикам.")
         return
     mode = user_rp_mode.get(user.id, 'inactive')
     data = user_rp_data.get(user.id, {})
@@ -2397,9 +2394,6 @@ async def rp_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def rp_stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     if not user:
-        return
-    if not is_developer(user.id):
-        await update.message.reply_text("Эта команда доступна только разработчикам.")
         return
     chat_id = update.effective_chat.id
     await end_rp(user.id, context.bot, chat_id, reason="Ролевая игра завершена по вашему запросу.")
@@ -2749,28 +2743,12 @@ async def send_invite_links_to_new_member(context: ContextTypes.DEFAULT_TYPE, us
         return
 
     links = []
-    needs_invite = False  # хотя бы в один из чатов пользователь ещё не вступил
-
     for chat_id in INVITE_CHAT_IDS:
-        try:
-            member = await context.bot.get_chat_member(chat_id, user_id)
-            if member.status in ("member", "administrator", "creator"):
-                continue  # уже состоит в этом чате — ссылка на него не нужна
-        except TelegramError as e:
-            logger.warning(
-                f"Не удалось проверить членство {user_id} в чате {chat_id}, отправляю ссылку на всякий случай: {e}"
-            )
-
-        needs_invite = True
         link = await _get_chat_invite_link(context, chat_id)
         if not link:
             continue
         expected_newcomers.setdefault(chat_id, set()).add(user_id)
         links.append(link)
-
-    if not needs_invite:
-        logger.info(f"Пользователь {user_id} уже состоит во всех нужных чатах — ссылка не отправлена.")
-        return
 
     if not links:
         try:
@@ -2804,7 +2782,19 @@ async def chat_join_request_callback(update: Update, context: ContextTypes.DEFAU
     chat_id = request.chat.id
     applicant = request.from_user
 
-    if applicant.id in expected_newcomers.get(chat_id, set()):
+    # Одобряем автоматически ТОЛЬКО заявки, поданные именно по нашей
+    # пригласительной ссылке (той, что бот сам выдал в send_invite_links_to_new_member).
+    # Заявки по любым другим ссылкам в этот же чат под автоодобрение не попадают —
+    # они остаются для ручной модерации.
+    used_link = request.invite_link.invite_link if request.invite_link else None
+    expected_link = _invite_link_cache.get(chat_id)
+
+    if (
+        applicant.id in expected_newcomers.get(chat_id, set())
+        and used_link is not None
+        and expected_link is not None
+        and used_link == expected_link
+    ):
         try:
             await request.approve()
         except TelegramError as e:
@@ -4241,13 +4231,13 @@ async def set_commands(application: Application):
         BotCommand("lore", "История Омниреальности"),
         BotCommand("links", "Полезные ссылки (инфо, анкетница, новости, мемы)"),
         BotCommand("feedback", "Отправить отзыв или жалобу"),
+        # RP-команды
+        BotCommand("rp_status", "Показать статус RP"),
+        BotCommand("rp_stop", "Завершить RP"),
     ]
     await application.bot.set_my_commands(public_commands, scope=BotCommandScopeDefault())
 
     owner_commands = public_commands + [
-        # RP-команды (только для разработчиков)
-        BotCommand("rp_status", "Показать статус RP"),
-        BotCommand("rp_stop", "Завершить RP"),
         BotCommand("addanketnik", "Назначить анкетника"),
         BotCommand("resetcd", "Обнулить кулдаун на отправку анкеты у участника"),
         BotCommand("forcefacts", "Принудительно запустить извлечение фактов ИИ"),
