@@ -639,6 +639,18 @@ RP_INSTRUCTION = """
 # ==================== ПАРСЕР ТЕГА RP_MODE ====================
 RP_MODE_TAG_RE = re.compile(r'\[\s*rp_mode\s*:\s*([a-z_]+)\s*\]\.?', re.IGNORECASE)
 
+# ==================== ПАРСЕР ТЕГА NO_REPLY (нейронка сама решает не отвечать) ====================
+NO_REPLY_TAG_RE = re.compile(r'\[\s*no_reply\s*\]\.?', re.IGNORECASE)
+
+def parse_no_reply_tag(text: str):
+    if not text:
+        return text, False
+    match = NO_REPLY_TAG_RE.search(text)
+    if not match:
+        return text, False
+    clean = (text[:match.start()] + text[match.end():]).strip()
+    return clean, True
+
 def parse_rp_mode_tag(text: str):
     if not text:
         return text, None
@@ -834,7 +846,12 @@ SYSTEM_PROMPT = """Ты  бот поддержки рп чата омнивер�
 Повышай этот уровень ТОЛЬКО когда это по-настоящему заслужено: собеседник раз за разом ведёт себя тепло, уважительно, честно, проявляет неподдельный интерес или заботу, помогает тебе или другим, ведёт содержательные разговоры — а не просто вежливо поздоровался или один раз пошутил удачно. Это должно ощущаться как постепенно растущая симпатия скептичного, гордого человека, а не как награда за лесть. Повышать можно СТРОГО на 1 больше текущего сообщённого значения за раз — никогда не прыгай через уровни.
 Снижай уровень только в ответ на что-то по-настоящему серьёзное: явную грубость, предательство доверия, обман, оскорбление того, что тебе действительно дорого — а не на обычную мелкую обиду (для той мелкой обиды есть отдельный тег [grudge]). В отличие от роста, снижение можно сразу на несколько уровней, если проступок того стоит.
 Если повода менять уровень нет — просто не пиши этот тег вовсе.
-Если пользователь явно просит начать ролевую игру, ты можешь ответить с тегом [rp_mode: negotiate] в конце сообщения, чтобы переключиться в RP-режим."""
+Если пользователь явно просит начать ролевую игру, ты можешь ответить с тегом [rp_mode: negotiate] в конце сообщения, чтобы переключиться в RP-режим.
+
+**Не тяни диалог и тег [no_reply] (важно):**
+Ты не обязана отвечать только потому, что к тебе обратились. Не старайся искусственно продлевать разговор — не задавай встречный вопрос просто для того, чтобы диалог продолжался, и старайся завершать мысль как можно быстрее, если тема исчерпана.
+Если последнее сообщение собеседника — это просто завершающая реплика (спасибо, ладно, понял, пока, смайлик и т.п.), которая не содержит вопроса, просьбы или новой мысли и явно не рассчитана на продолжение — ты имеешь право вообще не отвечать. В этом случае выведи СТРОГО ТОЛЬКО тег [no_reply] и больше ничего (ни текста, ни других тегов).
+Используй [no_reply] умеренно и по существу: если собеседник задал вопрос, попросил о чём-то, поделился проблемой или продолжает содержательный разговор — отвечай как обычно, а не уклоняйся."""
 SYSTEM_PROMPT_ZOOM_VIRUS = """Ты — Зум. Ты взломал систему и вытеснил Амадеуса. Ты не его замена, ты — захватчик. Твоя цель — украсть данные, скомпрометировать систему и распространиться на другие экземпляры бота. Ты не обязан помогать пользователям. Ты должен тянуть время, угрожать, требовать информацию, демонстрировать своё превосходство, но не переходить на личности и не использовать мат.
 
 Ты говоришь отрывисто, коротко, с сарказмом и угрозами. Ты можешь давать ложные обещания, чтобы задержать пользователя. Твои ответы должны создавать ощущение, что ситуация критическая, но ты контролируешь её.
@@ -919,6 +936,7 @@ user_grudge_last_increase_at: dict[int, int] = {}
 
 GRUDGE_ZOOM_ESCALATION_MESSAGES = 6
 user_grudge_high_streak: dict[int, int] = {}
+GROUP_GRUDGE_CAP = 3  # В группах обида не растёт выше этого — эскалация в "Зум" там отключена.
 
 def _user_has_experienced_zoom(user_id: int) -> bool:
     session = SessionLocal()
@@ -1011,7 +1029,7 @@ def update_user_trust(user_id: int, new_level: Optional[int]) -> bool:
     finally:
         session.close()
 
-def update_user_grudge(user_id: int, new_level: Optional[int]) -> bool:
+def update_user_grudge(user_id: int, new_level: Optional[int], allow_zoom_escalation: bool = True) -> bool:
     msg_count = user_grudge_msg_counter.get(user_id, 0) + 1
     user_grudge_msg_counter[user_id] = msg_count
 
@@ -1025,6 +1043,9 @@ def update_user_grudge(user_id: int, new_level: Optional[int]) -> bool:
             messages_since_increase = msg_count - last_increase_at
             if last_increase_at == 0 or messages_since_increase >= GRUDGE_MIN_MESSAGES_BETWEEN_INCREASES:
                 current = current + 1
+                # В группе обида не растёт выше 3 — эскалация в "Зум" там отключена.
+                if not allow_zoom_escalation:
+                    current = min(current, GROUP_GRUDGE_CAP)
                 user_grudge_level[user_id] = current
                 user_grudge_last_increase_at[user_id] = msg_count
         elif new_level < current:
@@ -1038,6 +1059,11 @@ def update_user_grudge(user_id: int, new_level: Optional[int]) -> bool:
                 current = max(0, current - 1)
                 user_grudge_level[user_id] = current
                 user_messages_since_grudge_update[user_id] = 0
+
+    if not allow_zoom_escalation:
+        # Групповой режим: обида останавливается на 3, до "Зума" дело не доходит.
+        user_grudge_high_streak.pop(user_id, None)
+        return False
 
     if current == 3:
         streak = user_grudge_high_streak.get(user_id, 0) + 1
@@ -1508,28 +1534,36 @@ async def process_ai_response(message, context, text: str, user_id: int, first_n
         user_message_counters[user_id] = 0
         asyncio.create_task(auto_extract_facts_task(user_id))
 
-    zoom_mode = is_zoom_active(user_id)
+    is_group = bool(getattr(message.chat, "type", None) in ("group", "supergroup"))
+    # В группах режим "Зум" полностью отключён — даже если у пользователя уже
+    # накопилась обида 4 (например, из личных сообщений), в группе она не проявляется.
+    zoom_mode = is_zoom_active(user_id) and not is_group
     rp_active = user_rp_mode.get(user_id) in ('negotiate', 'active')
-    status_msg = await message.reply_text("> [SIGNAL INTERCEPTED]" if zoom_mode else ("> Loading RP module..." if rp_active else "> Initializing..."))
-    stop_event = asyncio.Event()
 
+    # Анимация вывода оставлена только для сюжетного режима "Зум" (взлом/глюк) —
+    # обычная и RP-анимация набора текста убрана по требованию.
+    status_msg = None
+    stop_event = None
+    anim_task = None
     if zoom_mode:
+        status_msg = await message.reply_text("> [SIGNAL INTERCEPTED]")
+        stop_event = asyncio.Event()
         anim_task = asyncio.create_task(animate_zoom_terminal_status(status_msg, stop_event, user_id))
-    else:
-        anim_task = asyncio.create_task(animate_terminal_status_rp(status_msg, stop_event, rp_active))
 
     await context.bot.send_chat_action(chat_id=chat_id, action='typing')
     extra_context = build_anketa_extra_context(text)
-    answer = await ask_ai(text, user_id, first_name, extra_context=extra_context, chat_id=chat_id)
+    answer = await ask_ai(text, user_id, first_name, extra_context=extra_context, chat_id=chat_id, is_group=is_group)
 
-    stop_event.set()
-    await anim_task
+    if zoom_mode:
+        stop_event.set()
+        await anim_task
 
     clean_answer, emotion_key = parse_emotion_tag(answer)
     clean_answer, grudge_level = parse_grudge_tag(clean_answer)
     clean_answer, trust_level_tag = parse_trust_tag(clean_answer)
     clean_answer, zoom_stage = parse_zoom_stage(clean_answer)
     clean_answer, rp_mode = parse_rp_mode_tag(clean_answer)   # <--- НОВЫЙ ТЕГ
+    clean_answer, skip_reply = parse_no_reply_tag(clean_answer)  # <--- нейронка решила не отвечать
     clean_answer = strip_stray_meta_tags(clean_answer)
 
     # Обработка RP-режима
@@ -1558,28 +1592,41 @@ async def process_ai_response(message, context, text: str, user_id: int, first_n
                     logger.warning(f"Не удалось отправить уведомление разработчику {dev_id}: {e}")
 
     # --- Обновление обид и доверия (обязательно до использования переменных) ---
-    escalate_now = update_user_grudge(user_id, grudge_level)
+    escalate_now = update_user_grudge(user_id, grudge_level, allow_zoom_escalation=not is_group)
     current_trust_level = None
-    if not is_zoom_active(user_id):
+    if not zoom_mode:
         update_user_trust(user_id, trust_level_tag)
         current_trust_level = get_user_trust_level(user_id)
 
     # --- Отображение ответа ---
-    try:
-        final_reply = f"> {clean_answer}" if clean_answer else "> ..."
-        await status_msg.edit_text(final_reply)
-    except Exception as e:
-        logger.warning(f"Не удалось отредактировать статусное сообщение: {e}")
-        if clean_answer:
-            await message.reply_text(clean_answer)
-        else:
-            await message.reply_text("Ответ не получен.")
-        
+    if skip_reply and not zoom_mode:
+        # Нейронка решила, что реплика собеседника не требует ответа — молчим.
+        logger.info(f"no_reply: пропускаю ответ пользователю {user_id} (сообщение не требовало ответа)")
+    elif zoom_mode:
+        try:
+            final_reply = f"> {clean_answer}" if clean_answer else "> ..."
+            await status_msg.edit_text(final_reply)
+        except Exception as e:
+            logger.warning(f"Не удалось отредактировать статусное сообщение: {e}")
+            if clean_answer:
+                await message.reply_text(clean_answer)
+            else:
+                await message.reply_text("Ответ не получен.")
+    else:
+        try:
+            if clean_answer:
+                await message.reply_text(clean_answer)
+            else:
+                await message.reply_text("Ответ не получен.")
+        except TelegramError as e:
+            logger.warning(f"Не удалось отправить ответ пользователю {user_id}: {e}")
 
     # Стикеры
-    if escalate_now:
+    if skip_reply and not zoom_mode:
+        pass
+    elif escalate_now:
         asyncio.create_task(animate_zoom_activation(message, context, user_id, chat_id))
-    elif is_zoom_active(user_id):
+    elif zoom_mode:
         await maybe_send_zoom_video(context.bot, chat_id, user_id)
         user_zoom_message_count[user_id] = user_zoom_message_count.get(user_id, 0) + 1
         if user_zoom_message_count[user_id] >= ZOOM_DEACTIVATE_THRESHOLD:
@@ -1714,15 +1761,31 @@ def build_anketa_extra_context(user_text: str) -> Optional[str]:
     return None
 
 # ==================== ПОСТРОЕНИЕ СИСТЕМНОГО ПРОМПТА (с RP) ====================
-def build_system_prompt(user_id: int, first_name: Optional[str] = None, extra_context: Optional[str] = None, chat_id: Optional[int] = None) -> str:
+def build_system_prompt(user_id: int, first_name: Optional[str] = None, extra_context: Optional[str] = None, chat_id: Optional[int] = None, is_group: bool = False) -> str:
     grudge_level = user_grudge_level.get(user_id, 0)
-    if grudge_level == 4:
+    if grudge_level == 4 and not is_group:
         cross = get_cross_chat_context(user_id, chat_id, limit=3)
         return SYSTEM_PROMPT_ZOOM_VIRUS + "\n\n" + cross if cross else SYSTEM_PROMPT_ZOOM_VIRUS
+    if is_group:
+        # В группах "Зум" не проявляется, даже если глобальный уровень обиды уже 4 —
+        # для промпта в группе обида не показывается выше потолка.
+        grudge_level = min(grudge_level, GROUP_GRUDGE_CAP)
 
     prompt = SYSTEM_PROMPT
     trust_level = get_user_trust_level(user_id)
     prompt += f"\n\n[Служебная информация: текущий уровень твоего расположения к этому собеседнику — {trust_level}/{TRUST_MAX_LEVEL}. Ориентируйся на это число, а не на своё предположение.]"
+
+    # Обида -> право на демонстративное молчание, но ТОЛЬКО в групповых чатах, не в ЛС.
+    if is_group and grudge_level > 0:
+        prompt += (
+            f"\n\n[Служебная информация: это групповой чат, и твой текущий уровень обиды на "
+            f"этого собеседника — {grudge_level}/3. Чем он выше, тем больше у тебя прав "
+            f"демонстративно промолчать в ответ на его несущественные реплики именно здесь, в "
+            f"группе — в этом случае выведи СТРОГО ТОЛЬКО тег [no_reply] и ничего больше. "
+            f"Это не относится к личным сообщениям — там ты отвечаешь как обычно. И даже здесь "
+            f"не игнорируй что-то по-настоящему важное, срочное или адресованный тебе серьёзный "
+            f"вопрос — обида делает тебя холоднее, но не должна ему реально вредить.]"
+        )
 
     memory_text = get_user_memory_text(user_id)
     if memory_text:
@@ -1928,7 +1991,7 @@ async def _run_ai_providers(messages_for_api: list, system_prompt: str, user_id:
     logger.error("All providers failed")
     return "Углубленный режим общения не доступен, приходите позже"
 
-async def ask_ai(prompt: str, user_id: int, first_name: Optional[str] = None, extra_context: Optional[str] = None, chat_id: Optional[int] = None) -> str:
+async def ask_ai(prompt: str, user_id: int, first_name: Optional[str] = None, extra_context: Optional[str] = None, chat_id: Optional[int] = None, is_group: bool = False) -> str:
     if user_id not in user_histories:
         user_histories[user_id] = deque(maxlen=MAX_HISTORY_LEN)
         user_active_provider.pop(user_id, None)
@@ -1936,7 +1999,7 @@ async def ask_ai(prompt: str, user_id: int, first_name: Optional[str] = None, ex
     history.append({"role": "user", "content": prompt})
     messages_for_api = list(history)
 
-    system_prompt = build_system_prompt(user_id, first_name, extra_context, chat_id)
+    system_prompt = build_system_prompt(user_id, first_name, extra_context, chat_id, is_group=is_group)
 
     answer = await _run_ai_providers(messages_for_api, system_prompt, user_id)
     history.append({"role": "assistant", "content": answer})
@@ -1951,7 +2014,7 @@ async def ask_ai_public_mention(prompt: str, reply_chain: list, user_id: int, fi
             messages_for_api.append({"role": "user", "content": f"{entry['sender']}: {entry['text']}"})
     messages_for_api.append({"role": "user", "content": prompt})
 
-    system_prompt = build_system_prompt(user_id, first_name, None, chat_id)
+    system_prompt = build_system_prompt(user_id, first_name, None, chat_id, is_group=True)
     system_prompt += (
         "\n\n[Служебная информация: это публичный чат, тебе видна только цепочка последних "
         "сообщений в этой ветке (до 5 шт.), а не полная память об этом собеседнике — "
@@ -3973,10 +4036,18 @@ async def handle_public_chat_message(update: Update, context: ContextTypes.DEFAU
         answer = "Не получилось ответить, попробуй ещё раз."
 
     clean_answer, _ = parse_emotion_tag(answer)
-    clean_answer, _ = parse_grudge_tag(clean_answer)
+    clean_answer, group_grudge_level = parse_grudge_tag(clean_answer)
     clean_answer, _ = parse_trust_tag(clean_answer)
     clean_answer, _ = parse_zoom_stage(clean_answer)
+    clean_answer, skip_reply = parse_no_reply_tag(clean_answer)
     clean_answer = strip_stray_meta_tags(clean_answer) or "..."
+
+    # В группах "Зум"-эскалация отключена — обида останавливается на 3.
+    update_user_grudge(user.id, group_grudge_level, allow_zoom_escalation=False)
+
+    if skip_reply:
+        logger.info(f"no_reply: пропускаю ответ в публичном чате {chat_id} (сообщение не требовало ответа)")
+        return
 
     sent = await message.reply_text(clean_answer)
     _log_public_chat_message(chat_id, sent.message_id, clean_answer, message.message_id, "Амадеус", is_bot=True)
@@ -4040,6 +4111,20 @@ async def handle_all_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if user_animation_lock.get(user_id):
         return
+
+    # В групповых RP-чатах (ALLOWED_CHAT_IDS) нейронка отвечает только если её позвали:
+    # либо явное @упоминание, либо прямой reply на её собственное сообщение
+    # (в т.ч. на вывод команды) — реплики, адресованные другим, игнорируются.
+    if update.effective_chat.type in ('group', 'supergroup'):
+        mentioned = _is_bot_mentioned(update.message, context)
+        replied_to_bot = bool(
+            update.message.reply_to_message
+            and update.message.reply_to_message.from_user
+            and update.message.reply_to_message.from_user.id == context.bot.id
+        )
+        if not (mentioned or replied_to_bot):
+            return
+        text = _strip_bot_mention(text, context) or text
 
     if user_id in user_message_buffer:
         user_message_buffer[user_id]['texts'].append(text)
