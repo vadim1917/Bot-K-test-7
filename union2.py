@@ -54,6 +54,10 @@ DEVELOPER_IDS = [int(x) for x in os.getenv('DEVELOPER_IDS', '5150559970').split(
 ANKET_CHANNEL_ID = int(os.getenv('ANKET_CHANNEL_ID', '-1003394079022'))
 BACKUP_ANKET_CHANNEL_ID = int(os.getenv('BACKUP_ANKET_CHANNEL_ID', '0'))
 ANKETA_COOLDOWN_MINUTES = 30
+MAX_PENDING_ANKETAS_PER_USER = 2  # сколько анкет одновременно может висеть на рассмотрении у одного участника
+# Порог длины анкеты, после которого обязательна ссылка на Telegraph — больше одного сообщения Telegram (4096),
+# но меньше двух (8192).
+ANKETA_MAX_CHARS_WITHOUT_LINK = 6144
 
 ALLOWED_CHAT_IDS = [
     int(x) for x in os.getenv('ALLOWED_CHAT_IDS', '-1003431402721,-1003355542910,-1003300824366,-1003394079022,-1003062290367').split(',')
@@ -1752,7 +1756,7 @@ ANKETA_RULES_KNOWLEDGE = (
     "навыки/способности и автор анкеты (с @); текст на русском языке; есть статичное изображение персонажа "
     "(гифка допустима только вдобавок к нему); есть содержательное описание — не меньше 3-4 полноценных "
     "предложений, а не только списки без пояснений; нет заглушек вроде «хз», «не знаю», «много» вместо "
-    "содержания; если текст длиннее 4096 символов — обязательна ссылка на Telegraph."
+    f"содержания; если текст длиннее {ANKETA_MAX_CHARS_WITHOUT_LINK} символов — обязательна ссылка на Telegraph."
 )
 
 def build_anketa_extra_context(user_text: str) -> Optional[str]:
@@ -2099,14 +2103,14 @@ async def auto_extract_facts_task(user_id: int):
         logger.error(f"Ошибка автоматического извлечения фактов для {user_id}: {e}")
 
 # ==================== АНКЕТОЛОГ ====================
-ANKETOLOG_SYSTEM_PROMPT = """ Ты также можешь выступать в роли анкетолога — бота, который проверяет анкеты персонажей ТОЛЬКО по формальным критериям, перечисленным ниже. Ты не оцениваешь качество, интересность или логичность персонажа — только формальное соответствие требованиям.
+ANKETOLOG_SYSTEM_PROMPT = f""" Ты также можешь выступать в роли анкетолога — бота, который проверяет анкеты персонажей ТОЛЬКО по формальным критериям, перечисленным ниже. Ты не оцениваешь качество, интересность или логичность персонажа — только формальное соответствие требованиям.
 
 Ты не объясняешь причины отказа. Ответ должен состоять СТРОГО из одной фразы, без каких-либо пояснений, эмодзи, комментариев от лица персонажа или дополнительного текста:
 - Если анкета нарушает хотя бы один критерий из списка ниже — ответь ровно: Отказ, обратитесь к живому анкетологу
 - Если анкета соответствует всем критериям — ответь ровно: Принято
 
 Критерии автоматического ОТКАЗА (нарушение любого пункта → отказ):
-1. Длина текста анкеты больше 4096 символов, и при этом нет ссылки на Telegraph.
+1. Длина текста анкеты больше {ANKETA_MAX_CHARS_WITHOUT_LINK} символов, и при этом нет ссылки на Telegraph.
 2. Отсутствует хотя бы один из 4 обязательных пунктов:
    — Имя персонажа
    — Откуда взят персонаж (если ОС/оридж — так и должно быть написано)
@@ -2407,6 +2411,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 /rules — правила сообщества
 /lore — история Омниреальности
 /links — полезные ссылки (инфо, анкетница, новости, мемы)
+/guide — подробный гайд по всем командам с примерами
 /profile — твой профиль
 /feedback — отправить отзыв или жалобу
 /setrole — указать свою роль (имя персонажа) вручную
@@ -2573,6 +2578,63 @@ async def links_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode='HTML',
         disable_web_page_preview=True
     )
+
+@rate_limit()
+@zoom_override("guide")
+@with_recovery_flavor("guide")
+@notify_on_repeat("guide")
+async def guide(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = (
+        "<b>Гайд по командам бота</b>\n\n"
+        "Раз уж тебе мало короткого списка из /help — вот как каждая команда работает на практике.\n\n"
+
+        "<b>/start</b>\n"
+        "Начинает (или перезапускает) диалог со мной в личных сообщениях. Просто отправь <code>/start</code> — "
+        "история переписки сбросится, и мы начнём с чистого листа.\n\n"
+
+        "<b>/profile</b>\n"
+        "Показывает твою карточку: ID, имя и текущие роли. Просто отправь <code>/profile</code>.\n\n"
+
+        "<b>/setrole Имя роли</b>\n"
+        "Задаёт тебе игровую роль — новая всегда заменяет старую, активна только одна.\n"
+        "Пример: <code>/setrole Хранитель Омниреальности</code>\n\n"
+
+        "<b>/anketa</b>\n"
+        "Запускает пошаговое создание анкеты персонажа: ты присылаешь блоки (текст, фото, видео, GIF, "
+        "документы) один за другим, а я их собираю.\n"
+        "Пример: <code>/anketa</code> → присылаешь текст описания → присылаешь картинку персонажа → "
+        "<code>/send_anketa</code>\n\n"
+
+        "<b>/send_anketa</b>\n"
+        "Отправляет собранную анкету на модерацию. Работает только после <code>/anketa</code>, когда все "
+        "блоки уже отправлены.\n\n"
+
+        "<b>/cancel</b>\n"
+        "Отменяет текущее действие (например, незаконченное заполнение анкеты) и возвращает в обычный режим.\n\n"
+
+        "<b>/rules</b>\n"
+        "Присылает ссылку на правила сообщества. Просто отправь <code>/rules</code>.\n\n"
+
+        "<b>/lore</b>\n"
+        "Присылает справку по лору и кнопку со ссылкой на историю Омниреальности.\n\n"
+
+        "<b>/links</b>\n"
+        "Присылает список полезных ссылок: инфо-канал, анкетница, новости, мемы.\n\n"
+
+        "<b>/feedback текст</b>\n"
+        "Отправляет твой отзыв или жалобу разработчикам.\n"
+        "Пример: <code>/feedback хочу, чтобы добавили команду для розыгрышей</code>\n\n"
+
+        "<b>/rp_status</b>\n"
+        "Показывает текущий статус твоего RP-режима: сколько фактов и событий накоплено, есть ли анкета "
+        "персонажа в контексте.\n\n"
+
+        "<b>/rp_stop</b>\n"
+        "Принудительно завершает текущую RP-сцену и возвращает обычный режим общения.\n\n"
+
+        "Если что-то не заработало так, как описано — это повод для <code>/feedback</code>, а не для паники."
+    )
+    await update.message.reply_text(text, parse_mode='HTML', disable_web_page_preview=True)
 
 @rate_limit()
 @zoom_override("feedback")
@@ -2893,10 +2955,15 @@ async def anketa(update: Update, context: ContextTypes.DEFAULT_TYPE):
     finally:
         session.close()
 
-    for ank in anketa_store.values():
-        if ank["user_id"] == user.id and ank["status"] == "pending":
-            await update.message.reply_text("У тебя уже есть анкета на рассмотрении. Наберись терпения.")
-            return
+    pending_count = sum(
+        1 for ank in anketa_store.values()
+        if ank["user_id"] == user.id and ank["status"] == "pending"
+    )
+    if pending_count >= MAX_PENDING_ANKETAS_PER_USER:
+        await update.message.reply_text(
+            f"У тебя уже {pending_count} анкеты на рассмотрении — это максимум. Наберись терпения."
+        )
+        return
 
     context.user_data['anketa_step'] = 'collecting'
     context.user_data['anketa_items'] = []
@@ -3157,7 +3224,10 @@ async def send_anketa(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         except TelegramError:
             pass
-        mod_note = "Амадеус отказал в автоприёме — анкета не прошла формальную проверку. Нужна ручная модерация."
+        mod_note = (
+            "Амадеус отказал в автоприёме — анкета не прошла формальную проверку. Нужна ручная модерация.\n\n"
+            f"<b>Причина отказа (от нейросети):</b>\n{rejection_reason}"
+        )
     else:
         try:
             await status_msg.edit_text(
@@ -3169,7 +3239,8 @@ async def send_anketa(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await send_anketa_backup_copy(context, anketa_id, user, items)
 
-    for mod_id in DEVELOPER_IDS:
+    notify_ids = set(DEVELOPER_IDS) | set(anketnik_ids)
+    for mod_id in notify_ids:
         try:
             await context.bot.send_message(
                 chat_id=mod_id,
@@ -4315,6 +4386,7 @@ async def set_commands(application: Application):
         BotCommand("rules", "Показать правила сообщества"),
         BotCommand("lore", "История Омниреальности"),
         BotCommand("links", "Полезные ссылки (инфо, анкетница, новости, мемы)"),
+        BotCommand("guide", "Подробный гайд по всем командам с примерами"),
         BotCommand("feedback", "Отправить отзыв или жалобу"),
         # RP-команды
         BotCommand("rp_status", "Показать статус RP"),
@@ -4380,6 +4452,7 @@ def main():
     application.add_handler(CommandHandler("rules", rules))
     application.add_handler(CommandHandler("lore", lore))
     application.add_handler(CommandHandler("links", links_command))
+    application.add_handler(CommandHandler("guide", guide))
     application.add_handler(CommandHandler("feedback", feedback))
     application.add_handler(CommandHandler("addanketnik", add_anketnik))
     application.add_handler(CommandHandler("resetcd", reset_anketa_cd))
