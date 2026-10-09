@@ -226,6 +226,15 @@ class InfoSubscription(Base):
 
     user = relationship("User", back_populates="info_subscriptions")
 
+class SorolSeeker(Base):
+    __tablename__ = "sorol_seekers"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    user_id = Column(BigInteger, ForeignKey("users.id"), unique=True)
+    username = Column(String, nullable=True)
+    first_name = Column(String, nullable=True)
+    text = Column(Text)
+    created_at = Column(DateTime, default=datetime.datetime.now)
+
 # ==================== СОЗДАНИЕ ТАБЛИЦ ====================
 def create_tables():
     Base.metadata.create_all(bind=engine)
@@ -539,6 +548,37 @@ def strip_stray_meta_tags(text: str) -> str:
         return text
     cleaned = STRAY_META_TAG_RE.sub('', text)
     return re.sub(r'\s{2,}', ' ', cleaned).strip()
+
+# ==================== РОФЛ-СТИКЕРЫ ДЛЯ ОДНОГО УЧАСТНИКА ====================
+# Впиши сюда юзернейм(ы) без @ — для них иногда вместо обычного стикера эмоции
+# будет отправляться один из стикеров ниже. Пустой список = функция выключена.
+ROFL_STICKER_USERNAMES: list[str] = [
+    "SMG_Guy",
+]
+ROFL_STICKER_CHANCE = 0.25  # шанс (0.0–1.0), что обычный стикер заменится рофл-стикером
+
+ROFL_STICKERS: list[str] = [
+    "CAACAgIAAxkBA6AHx2rJCpPLWzdV2P1PI7daYi8u457aAAIJUwACkxFwSnsvD__ngnuMPQQ",
+    "CAACAgIAAxkBA6AHzWrJCqC_N0gpw8aDcstYP5BNcuZLAAK5VgACEEZxSjVc8X5sr2dhPQQ",
+    "CAACAgIAAxkBA6AHtGrJCm71fIwxiLeNAWv5OQ1X13nXAAKTSAACfQ95Shs1dH9C2siAPQQ",
+    "CAACAgIAAxkBA6AH1WrJCqwVBSb0Xy9Rzx3Q2terHTM0AAJtSwAC63lwSqTYEUNFiTZpPQQ",
+]
+
+async def maybe_send_rofl_sticker(bot, chat_id: int, username: Optional[str]) -> bool:
+    """Возвращает True, если вместо обычного стикера отправлен рофл-стикер."""
+    if not username or not ROFL_STICKERS or not ROFL_STICKER_USERNAMES:
+        return False
+    allowed = {u.lstrip("@").strip().lower() for u in ROFL_STICKER_USERNAMES if u and u.strip()}
+    if username.lstrip("@").lower() not in allowed:
+        return False
+    if random.random() >= ROFL_STICKER_CHANCE:
+        return False
+    try:
+        await bot.send_sticker(chat_id=chat_id, sticker=random.choice(ROFL_STICKERS))
+        return True
+    except TelegramError as e:
+        logger.warning(f"Не удалось отправить рофл-стикер: {e}")
+        return False
 
 async def send_emotion_sticker(bot, chat_id: int, emotion_key: Optional[str], zoom_stage: Optional[str] = None, user_id: Optional[int] = None):
     key = user_id if user_id is not None else chat_id
@@ -1641,7 +1681,10 @@ async def process_ai_response(message, context, text: str, user_id: int, first_n
             trust_sent = await maybe_send_trust_sticker(context.bot, chat_id, user_id, current_trust_level)
         # В RP-режиме стикеры отправляются реже
         if not trust_sent and emotion_key:
-            if rp_active:
+            rofl_username = message.from_user.username if getattr(message, "from_user", None) else None
+            if await maybe_send_rofl_sticker(context.bot, chat_id, rofl_username):
+                pass
+            elif rp_active:
                 if random.random() < RP_STICKER_CHANCE_MULTIPLIER:
                     await send_emotion_sticker(context.bot, chat_id, emotion_key, zoom_stage, user_id=user_id)
             else:
@@ -2425,6 +2468,11 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 <b>Ролевая игра (RP):</b>
 /rp_status — показать текущий статус RP
 /rp_stop — принудительно завершить RP
+
+<b>Поиск сорола:</b>
+/sorol_add — подать заявку: ищу сорола
+/sorol_list — список ищущих сорола
+/sorol_remove — снять свою заявку
 """
 
     if user and is_developer(user.id):
@@ -2994,6 +3042,8 @@ async def anketa_collect(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "text": update.message.text or update.message.caption or "",
         "file_id": None,
         "message_id": update.message.message_id,
+        "chat_id": update.effective_chat.id,
+        "entities": [],
         "sender": user.id
     }
 
@@ -3022,6 +3072,12 @@ async def anketa_collect(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if item["type"] == "text" and not item["text"].strip():
         await update.message.reply_text("Пустое сообщение. Отправь что-то содержательное.")
         return
+
+    # Сохраняем оформление Telegram (цитаты, жирный, курсив, спойлеры, моно, ссылки и т.д.)
+    if item["type"] == "text":
+        item["entities"] = list(update.message.entities or [])
+    else:
+        item["entities"] = list(update.message.caption_entities or [])
 
     context.user_data['anketa_items'].append(item)
     total = len(context.user_data['anketa_items'])
@@ -3056,6 +3112,50 @@ def _split_text_for_telegram(text: str, limit: int = TELEGRAM_TEXT_LIMIT) -> lis
         chunks.append(remaining)
     return chunks
 
+async def forward_anketa_item(bot, chat_id: int, item: dict):
+    """Отправляет одну часть анкеты с сохранением оформления Telegram
+    (цитаты, жирный, курсив, спойлеры, моно, ссылки, кастомные эмодзи)."""
+    # Основной способ: copy_message копирует сообщение 1 в 1 вместе с форматированием
+    if item.get("chat_id") and item.get("message_id"):
+        try:
+            await bot.copy_message(
+                chat_id=chat_id,
+                from_chat_id=item["chat_id"],
+                message_id=item["message_id"],
+            )
+            return
+        except TelegramError as e:
+            logger.warning(f"copy_message не сработал ({e}), пробую отправить с entities")
+
+    # Запасной способ: по file_id / тексту с сохранёнными entities (без parse_mode!)
+    text = item.get("text") or None
+    entities = item.get("entities") or None
+    t = item["type"]
+    if t == "text":
+        await bot.send_message(chat_id=chat_id, text=item["text"], entities=entities)
+    elif t == "photo":
+        await bot.send_photo(chat_id=chat_id, photo=item["file_id"], caption=text, caption_entities=entities)
+    elif t == "video":
+        await bot.send_video(chat_id=chat_id, video=item["file_id"], caption=text, caption_entities=entities)
+    elif t == "animation":
+        await bot.send_animation(chat_id=chat_id, animation=item["file_id"], caption=text, caption_entities=entities)
+    elif t == "document":
+        await bot.send_document(chat_id=chat_id, document=item["file_id"], caption=text, caption_entities=entities)
+
+async def forward_anketa_items(bot, chat_id: int, items: list):
+    """Отправляет все части анкеты по порядку. Сбой одной части не мешает остальным;
+    если что-то не ушло, после отправки всех частей поднимается первая ошибка."""
+    first_error = None
+    for item in items:
+        try:
+            await forward_anketa_item(bot, chat_id, item)
+        except TelegramError as e:
+            logger.error(f"Не удалось отправить часть анкеты в чат {chat_id}: {e}")
+            if first_error is None:
+                first_error = e
+    if first_error is not None:
+        raise first_error
+
 def _build_anketa_media_group(items: list):
     media_group = []
     text_parts = []
@@ -3076,17 +3176,7 @@ def _build_anketa_media_group(items: list):
     return media_group, text_parts
 
 async def forward_anketa_to_channel(context: ContextTypes.DEFAULT_TYPE, items: list):
-    media_group, text_parts = _build_anketa_media_group(items)
-
-    if media_group:
-        await context.bot.send_media_group(chat_id=ANKET_CHANNEL_ID, media=media_group)
-
-    if text_parts:
-        await context.bot.send_message(
-            chat_id=ANKET_CHANNEL_ID,
-            text="\n\n---\n\n".join(text_parts),
-            parse_mode='HTML'
-        )
+    await forward_anketa_items(context.bot, ANKET_CHANNEL_ID, items)
 
 async def send_anketa_backup_copy(context: ContextTypes.DEFAULT_TYPE, anketa_id: str, user, items: list):
     if not BACKUP_ANKET_CHANNEL_ID:
@@ -3099,15 +3189,7 @@ async def send_anketa_backup_copy(context: ContextTypes.DEFAULT_TYPE, anketa_id:
         )
         await context.bot.send_message(chat_id=BACKUP_ANKET_CHANNEL_ID, text=header, parse_mode='HTML')
 
-        media_group, text_parts = _build_anketa_media_group(items)
-        if media_group:
-            await context.bot.send_media_group(chat_id=BACKUP_ANKET_CHANNEL_ID, media=media_group)
-        if text_parts:
-            await context.bot.send_message(
-                chat_id=BACKUP_ANKET_CHANNEL_ID,
-                text="\n\n---\n\n".join(text_parts),
-                parse_mode='HTML'
-            )
+        await forward_anketa_items(context.bot, BACKUP_ANKET_CHANNEL_ID, items)
     except Exception as e:
         logger.error(f"Не удалось отправить резервную копию анкеты {anketa_id} в BACKUP_ANKET_CHANNEL_ID: {e}")
 
@@ -3253,17 +3335,10 @@ async def send_anketa(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 parse_mode='HTML'
             )
 
-            media_group, text_parts = _build_anketa_media_group(items)
-
-            if media_group:
-                await context.bot.send_media_group(chat_id=mod_id, media=media_group)
-
-            if text_parts:
-                await context.bot.send_message(
-                    chat_id=mod_id,
-                    text="<b>Текст анкеты:</b>\n\n" + "\n\n---\n\n".join(text_parts),
-                    parse_mode='HTML'
-                )
+            try:
+                await forward_anketa_items(context.bot, mod_id, items)
+            except TelegramError as e:
+                logger.error(f"Не все части анкеты {anketa_id} дошли до модератора {mod_id}: {e}")
 
             keyboard = [
                 [
@@ -3330,24 +3405,13 @@ async def anketa_review(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode='HTML'
         )
 
-        media_group, text_parts = _build_anketa_media_group(ank["items"])
-
-        if media_group:
-            try:
-                await context.bot.send_media_group(chat_id=chat_id, media=media_group)
-            except TelegramError as e:
-                logger.error(f"Не удалось отправить медиа анкеты {anketa_id} проверяющему {user.id}: {e}")
-                await update.message.reply_text(
-                    "⚠️ Не удалось загрузить медиа этой анкеты (см. лог)."
-                )
-
-        if text_parts:
-            full_text = "\n\n---\n\n".join(text_parts)
-            for chunk in _split_text_for_telegram(full_text):
-                await update.message.reply_text(
-                    f"Текст:\n{chunk}",
-                    parse_mode='HTML'
-                )
+        try:
+            await forward_anketa_items(context.bot, chat_id, ank["items"])
+        except TelegramError as e:
+            logger.error(f"Не удалось показать анкету {anketa_id} проверяющему {user.id}: {e}")
+            await update.message.reply_text(
+                "⚠️ Не удалось загрузить часть этой анкеты (см. лог)."
+            )
 
         await update.message.reply_text(
             "<b>Действия с анкетой:</b>",
@@ -3544,6 +3608,129 @@ async def anketa_dispute_callback(update: Update, context: ContextTypes.DEFAULT_
             "Я слушаю. Но не рассчитывай, что я смягчусь просто из вежливости."
         )
     )
+
+# ==================== ПОИСК СОРОЛОВ ====================
+SOROL_TTL_DAYS = 14
+SOROL_MAX_TEXT_LEN = 700
+SOROL_QUESTION = "Что хотите ролить и как зовут вашего перса?"
+
+def _html_escape(s: str) -> str:
+    return (s or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+@rate_limit()
+@zoom_override("sorol_add")
+@with_recovery_flavor("sorol_add")
+async def sorol_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if not user or not update.message:
+        return
+    session = SessionLocal()
+    try:
+        db_user, _ = get_or_create_user(session, user.id, user.username)
+        if db_user.is_banned:
+            await update.message.reply_text("Тебе сюда нельзя. Ты забанен.")
+            return
+    finally:
+        session.close()
+
+    context.user_data['sorol_step'] = 'waiting'
+    await update.message.reply_text(
+        f"{SOROL_QUESTION}\n\nОтветь одним сообщением. Отмена — /cancel."
+    )
+
+async def sorol_collect(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    """Вызывается из handle_all_text. True — сообщение обработано как ответ на вопрос."""
+    if context.user_data.get('sorol_step') != 'waiting':
+        return False
+    msg = update.message
+    user = update.effective_user
+    if not msg or not msg.text or msg.text.startswith('/') or not user:
+        return False
+
+    text = msg.text.strip()
+    if len(text) > SOROL_MAX_TEXT_LEN:
+        await msg.reply_text(f"Слишком длинно (максимум {SOROL_MAX_TEXT_LEN} символов). Сократи и отправь снова.")
+        return True
+
+    session = SessionLocal()
+    try:
+        get_or_create_user(session, user.id, user.username)
+        entry = session.query(SorolSeeker).filter_by(user_id=user.id).first()
+        if entry:
+            entry.text = text
+            entry.username = user.username
+            entry.first_name = user.first_name
+            entry.created_at = datetime.datetime.now()
+        else:
+            session.add(SorolSeeker(
+                user_id=user.id, username=user.username,
+                first_name=user.first_name, text=text,
+            ))
+        session.commit()
+    finally:
+        session.close()
+
+    context.user_data.pop('sorol_step', None)
+    await msg.reply_text(
+        f"Записала. Заявка висит {SOROL_TTL_DAYS} дн. Список — /sorol_list, снять — /sorol_remove."
+    )
+    return True
+
+@rate_limit()
+@zoom_override("sorol_list")
+@with_recovery_flavor("sorol_list")
+async def sorol_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message:
+        return
+    threshold = datetime.datetime.now() - datetime.timedelta(days=SOROL_TTL_DAYS)
+    session = SessionLocal()
+    try:
+        rows = (
+            session.query(SorolSeeker)
+            .filter(SorolSeeker.created_at >= threshold)
+            .order_by(SorolSeeker.created_at.desc())
+            .all()
+        )
+        data = [(r.user_id, r.username, r.first_name, r.text) for r in rows]
+    finally:
+        session.close()
+
+    if not data:
+        await update.message.reply_text("Сейчас никто не ищет сорола. Стань первым — /sorol_add.")
+        return
+
+    blocks = []
+    for uid, username, first_name, text in data:
+        if username:
+            who = f"@{_html_escape(username)}"
+        else:
+            who = f'<a href="tg://user?id={uid}">{_html_escape(first_name or "участник")}</a>'
+        blocks.append(f"{who}\n{_html_escape(text)}")
+
+    chunk = "<b>Ищут сорола:</b>\n\n"
+    for b in blocks:
+        piece = b + "\n\n"
+        if len(chunk) + len(piece) > 4000:
+            await update.message.reply_text(chunk, parse_mode='HTML', disable_web_page_preview=True)
+            chunk = ""
+        chunk += piece
+    if chunk.strip():
+        await update.message.reply_text(chunk, parse_mode='HTML', disable_web_page_preview=True)
+
+@rate_limit()
+@zoom_override("sorol_remove")
+@with_recovery_flavor("sorol_remove")
+async def sorol_remove(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if not user or not update.message:
+        return
+    session = SessionLocal()
+    try:
+        deleted = session.query(SorolSeeker).filter_by(user_id=user.id).delete()
+        session.commit()
+    finally:
+        session.close()
+    await update.message.reply_text("Заявка снята." if deleted else "У тебя нет активной заявки.")
 
 # ==================== АДМИН-КОМАНДЫ (без изменений) ====================
 async def add_anketnik(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -4144,6 +4331,9 @@ async def handle_all_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await update.message.reply_text("Не получилось отправить комментарий автору анкеты (см. лог).")
             return
 
+    if await sorol_collect(update, context):
+        return
+
     if is_user_banned_from_ai(user_id):
         asyncio.create_task(animate_grudge_ban(update.message, context, user_id))
         return
@@ -4391,6 +4581,10 @@ async def set_commands(application: Application):
         # RP-команды
         BotCommand("rp_status", "Показать статус RP"),
         BotCommand("rp_stop", "Завершить RP"),
+        # Поиск сорола
+        BotCommand("sorol_add", "Подать заявку: ищу сорола"),
+        BotCommand("sorol_list", "Список ищущих сорола"),
+        BotCommand("sorol_remove", "Снять свою заявку"),
     ]
     await application.bot.set_my_commands(public_commands, scope=BotCommandScopeDefault())
 
@@ -4467,6 +4661,10 @@ def main():
     # RP-команды
     application.add_handler(CommandHandler("rp_status", rp_status))
     application.add_handler(CommandHandler("rp_stop", rp_stop))
+    # Поиск сорола
+    application.add_handler(CommandHandler("sorol_add", sorol_add))
+    application.add_handler(CommandHandler("sorol_list", sorol_list))
+    application.add_handler(CommandHandler("sorol_remove", sorol_remove))
 
     application.add_handler(CallbackQueryHandler(anketa_dispute_callback, pattern="^anketa_dispute_"))
     application.add_handler(CallbackQueryHandler(anketa_reject_comment_callback, pattern="^anketa_rejcomment_"))
