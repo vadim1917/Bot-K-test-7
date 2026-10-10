@@ -34,6 +34,8 @@ from telegram.ext import (
     ContextTypes,
 )
 from telegram.error import TelegramError, RetryAfter, BadRequest
+import chess  # pip install chess
+import chess_game  # шахматный модуль (chess_game.py лежит рядом с ботом)
 user_animation_lock = {}
 
 # ==================== ПРОГРЕССИВНЫЙ АНТИСПАМ (БАНЫ) ====================
@@ -2618,6 +2620,16 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 /sorol_add — подать заявку: ищу сорола
 /sorol_list — список ищущих сорола
 /sorol_remove — снять свою заявку
+
+<b>Шахматы:</b>
+/chess — сыграть партию с Амадеусом (<code>/chess black</code> — играть чёрными)
+/chess_stop — сдаться и закончить партию
+
+<b>Шахматы в группе (игрок против игрока):</b>
+/chess_pvp — вызвать на партию (ответом на сообщение, <code>/chess_pvp @ник</code> или открытый вызов)
+/move — сделать ход командой, например <code>/move e4</code> (можно и просто написать ход сообщением)
+/chess_draw — предложить ничью или согласиться на неё
+/chess_stop — в группе: сдаться (админы — остановить партию)
 """
 
     if user and is_developer(user.id):
@@ -4360,6 +4372,596 @@ async def stopzoom(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except TelegramError as e:
         logger.warning(f"Не удалось отправить уведомление пользователю {target_id} о завершении Зума: {e}")
 
+# ==================== ШАХМАТЫ С АМАДЕУСОМ ====================
+# Ходы выбирает встроенный движок (см. chess_game.py): нейронке в промпте приходит 1-3 кандидата,
+# она выбирает один из них и ведёт диалог. Партии хранятся в памяти бота (как и RP-состояние).
+chess_games: dict[int, "chess_game.ChessGame"] = {}
+
+CHESS_BLACK_COLOR_ARGS = ('black', 'b', 'чёрные', 'черные', 'чёрными', 'черными', 'ч')
+CHESS_STICKER_CHANCE = 0.2   # шанс стикера эмоции после обычного хода (в начале и в конце партии — всегда)
+CHESS_LLM_FAIL_PREFIXES = ("Углубленный режим", "Ни один AI-провайдер")
+CHESS_START_FALLBACK = "Шахматы? Что ж, посмотрим, на что ты способен. Не рассчитывай на поблажки."
+CHESS_INPUT_RULES = (
+    "<b>Как вводить ходы</b>\n"
+    "• Обычная запись: <code>e4</code> — пешка идёт на e4, <code>Nf3</code> — фигура и клетка. "
+    "Буквы фигур: K — король, Q — ферзь, R — ладья, B — слон, N — конь; пешка без буквы.\n"
+    "• Русские буквы тоже подойдут: Кр, Ф, Л, С, К (это конь) — например <code>Кf3</code>, <code>Фh5</code>.\n"
+    "• Взятие: <code>Nxe5</code> или <code>exd5</code> (x можно не писать).\n"
+    "• Рокировка: <code>O-O</code> — короткая, <code>O-O-O</code> — длинная.\n"
+    "• Превращение пешки: <code>e8=Q</code> (в записи <code>e7e8</code> пешка станет ферзём).\n"
+    "• Если ход подходит двум фигурам, уточни: <code>Nbd2</code> или <code>R1e2</code>. "
+    "Можно и просто координатами: <code>e2e4</code>.\n"
+    "• Знаки <code>+</code>, <code>#</code>, <code>!</code> писать не нужно."
+)
+CHESS_HOWTO = (
+    CHESS_INPUT_RULES + "\n\n"
+    "После хода можно дописать комментарий в том же сообщении, например <code>e4 держи классику</code> — "
+    "я отвечу и на него. Сдаться: /chess_stop."
+)
+CHESS_RESIGN_REPLIES = [
+    "Сдаёшься? Что ж, записываю победу на свой счёт. Реванш — командой /chess.",
+    "Партия окончена, ты сдался. Не расстраивайся, думать головой тоже нужно учиться. /chess — если захочешь ещё.",
+    "Хорошо, остановимся. Но я запомнила, что ты сбежал с доски.",
+]
+
+
+def _chess_get_game(user_id: int):
+    game = chess_games.get(user_id)
+    if game and game.is_expired():
+        chess_games.pop(user_id, None)
+        return None
+    return game
+
+
+def _render_chess_message(game, comment: str, bot_san: Optional[str] = None, footer: Optional[str] = "Твой ход.") -> str:
+    parts = []
+    if comment:
+        parts.append(_html_escape(comment))
+    if bot_san:
+        parts.append(f"Мой ход: <b>{_html_escape(bot_san)}</b>")
+    board_txt = chess_game.render_board(game.board, game.user_color)
+    parts.append(f"<pre>{_html_escape(board_txt)}</pre>")
+    if footer:
+        parts.append(_html_escape(footer))
+    return "\n\n".join(parts)
+
+
+async def _chess_maybe_sticker(bot, chat_id: int, user_id: int, emotion_key: Optional[str], force: bool = False):
+    if not emotion_key:
+        return
+    if force or random.random() < CHESS_STICKER_CHANCE:
+        await send_emotion_sticker(bot, chat_id, emotion_key, None, user_id=user_id)
+
+
+async def _chess_ai_turn(game, user, situation: str, user_move_san: Optional[str] = None, comment: str = ""):
+    """Один «ход» Амадеуса. Возвращает (текст реплики, SAN сделанного хода | None, ключ эмоции).
+    Если нужен ход — движок готовит кандидатов, нейронка выбирает один (при сбое — лучший кандидат)."""
+    need_move = (
+        situation in ('start', 'move')
+        and game.board.turn == game.bot_color
+        and chess_game.result_info(game) is None
+    )
+    candidates = await asyncio.to_thread(chess_game.choose_candidates, game.board) if need_move else []
+
+    prompt = chess_game.build_prompt(game, situation, user_move_san, comment, candidates, user.first_name)
+    system_prompt = SYSTEM_PROMPT + "\n\n" + chess_game.CHESS_SYSTEM_ADDON
+    raw = await _run_ai_providers([{"role": "user", "content": prompt}], system_prompt, user.id)
+    llm_failed = raw.startswith(CHESS_LLM_FAIL_PREFIXES)
+
+    text, emotion_key = parse_emotion_tag(raw)
+    text, move_idx = chess_game.parse_chess_move_tag(text)
+    text, _ = parse_grudge_tag(text)
+    text, _ = parse_trust_tag(text)
+    text, _ = parse_zoom_stage(text)
+    text, _ = parse_rp_mode_tag(text)
+    text, _ = parse_no_reply_tag(text)
+    text = strip_stray_meta_tags(text)
+    if llm_failed:
+        text = ""
+
+    bot_san = None
+    if candidates:
+        if move_idx is not None and 1 <= move_idx <= len(candidates):
+            move = candidates[move_idx - 1]
+        else:
+            move = candidates[0]  # нейронка промолчала/ошиблась — ходит лучший кандидат движка
+        bot_san = game.board.san(move)
+        game.board.push(move)
+    return text, bot_san, emotion_key
+
+
+@rate_limit()
+@zoom_override("chess")
+@with_recovery_flavor("chess")
+async def chess_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if not user or not update.message:
+        return
+    if update.effective_chat.type != 'private':
+        await update.message.reply_text("Шахматы со мной — только в личных сообщениях, напиши мне туда. А чтобы сыграть с другим участником прямо здесь — /chess_pvp.")
+        return
+
+    session = SessionLocal()
+    try:
+        db_user, _ = get_or_create_user(session, user.id, user.username)
+        if db_user.is_banned:
+            await update.message.reply_text("Тебе сюда нельзя. Ты забанен.")
+            return
+    finally:
+        session.close()
+
+    if _chess_get_game(user.id):
+        await update.message.reply_text("Партия уже идёт — ходи. Если хочешь сдаться, пиши /chess_stop.")
+        return
+
+    args = [a.lower() for a in (context.args or [])]
+    user_color = chess.BLACK if args and args[0] in CHESS_BLACK_COLOR_ARGS else chess.WHITE
+
+    game = chess_game.ChessGame(user_color)
+    chess_games[user.id] = game
+    game.busy = True
+    chat_id = update.effective_chat.id
+    try:
+        await context.bot.send_chat_action(chat_id=chat_id, action='typing')
+        text, bot_san, emotion_key = await _chess_ai_turn(game, user, 'start')
+        text = text or CHESS_START_FALLBACK
+        game.add_dialog("Амадеус", text)
+        footer = (
+            "Ты играешь белыми — начинай." if user_color == chess.WHITE
+            else "Ты играешь чёрными — отвечай на мой ход."
+        )
+        await update.message.reply_text(
+            _render_chess_message(game, text, bot_san, footer=None) + "\n\n" + CHESS_HOWTO + "\n\n" + _html_escape(footer),
+            parse_mode='HTML'
+        )
+        await _chess_maybe_sticker(context.bot, chat_id, user.id, emotion_key, force=True)
+    except Exception as e:
+        logger.error(f"Не удалось начать шахматную партию для {user.id}: {e}", exc_info=True)
+        chess_games.pop(user.id, None)
+        await update.message.reply_text("Что-то пошло не так с доской. Попробуй /chess ещё раз.")
+    finally:
+        game.busy = False
+
+
+@rate_limit()
+@zoom_override("chess_stop")
+async def chess_stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if not user or not update.message:
+        return
+    if update.effective_chat.type in ('group', 'supergroup'):
+        pvp = _pvp_get_game(update.effective_chat.id)
+        if not pvp:
+            await update.message.reply_text("В этом чате нет активной партии.")
+            return
+        if pvp.color_of(user.id) is not None:
+            oid, oname = pvp.opponent_of(user.id)
+            pvp_games.pop(pvp.chat_id, None)
+            await update.message.reply_text(
+                f"{_mention(user.id, user.full_name)} сдался. Победил(а) {_mention(oid, oname)}.\n\n{_pvp_board_html(pvp)}",
+                parse_mode='HTML'
+            )
+        elif is_admin(user.id):
+            pvp_games.pop(pvp.chat_id, None)
+            await update.message.reply_text("Партия остановлена администратором.")
+        else:
+            await update.message.reply_text("Остановить партию могут только её участники и администраторы.")
+        return
+
+    game = chess_games.pop(user.id, None)
+    if not game:
+        await update.message.reply_text("Никакой партии сейчас нет. Хочешь сыграть — /chess.")
+        return
+    await update.message.reply_text(random.choice(CHESS_RESIGN_REPLIES))
+
+
+async def handle_chess_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    """Вызывается из handle_all_text. True — сообщение обработано как часть шахматной партии."""
+    user = update.effective_user
+    msg = update.message
+    if not user or not msg or not msg.text:
+        return False
+    game = _chess_get_game(user.id)
+    if not game:
+        return False
+    text = msg.text.strip()
+    if not text:
+        return False
+    if game.busy:
+        return True  # ещё думаю над прошлым ходом — лишние сообщения игнорируем
+
+    allowed, remaining = check_spam_and_ban(user.id)
+    if not allowed:
+        await msg.reply_text(
+            f"Антиспам: вы превысили лимит сообщений.\n"
+            f"Доступ к боту будет восстановлен через {remaining // 60} мин {remaining % 60} сек."
+        )
+        return True
+
+    chat_id = update.effective_chat.id
+    game.busy = True
+    game.touch()
+    stack_len = len(game.board.move_stack)
+    try:
+        await context.bot.send_chat_action(chat_id=chat_id, action='typing')
+        move, comment = chess_game.parse_message(game.board, text)
+
+        if move is None:
+            if chess_game.looks_like_move_attempt(text):
+                await msg.reply_text(
+                    "Такого хода нет — запись неверная или он нелегален.\n"
+                    f"Доступные ходы: {chess_game.legal_moves_san(game.board)}\n"
+                    "Формат: e4, Nf3, O-O, e2e4."
+                )
+                return True
+            # Не ход — просто разговор посреди партии.
+            reply_text, _, emotion_key = await _chess_ai_turn(game, user, 'chat', comment=text)
+            game.add_dialog("Собеседник", text)
+            game.add_dialog("Амадеус", reply_text)
+            if reply_text:
+                await msg.reply_text(reply_text)
+            await _chess_maybe_sticker(context.bot, chat_id, user.id, emotion_key)
+            return True
+
+        user_san = game.board.san(move)
+        game.board.push(move)
+        game.add_dialog("Собеседник", f"{user_san} {comment}".strip())
+
+        result = chess_game.result_info(game)
+        if result:  # партию закончил ход пользователя
+            kind, result_line = result
+            situation = 'user_won' if kind == 'user_won' else 'draw'
+            ai_text, _, emotion_key = await _chess_ai_turn(game, user, situation, user_move_san=user_san)
+            chess_games.pop(user.id, None)
+            await msg.reply_text(
+                _render_chess_message(game, ai_text, None, footer=result_line), parse_mode='HTML'
+            )
+            await _chess_maybe_sticker(context.bot, chat_id, user.id, emotion_key, force=True)
+            return True
+
+        ai_text, bot_san, emotion_key = await _chess_ai_turn(
+            game, user, 'move', user_move_san=user_san, comment=comment
+        )
+        result = chess_game.result_info(game)
+        if not result and game.board.turn != game.user_color:
+            raise RuntimeError("бот не сделал ход, а партия не закончена")
+        game.add_dialog("Амадеус", ai_text)
+
+        footer = "Твой ход."
+        if result:  # партию закончил ход бота
+            footer = result[1]
+            chess_games.pop(user.id, None)
+        await msg.reply_text(
+            _render_chess_message(game, ai_text, bot_san, footer=footer), parse_mode='HTML'
+        )
+        await _chess_maybe_sticker(context.bot, chat_id, user.id, emotion_key, force=bool(result))
+        return True
+    except Exception as e:
+        logger.error(f"Ошибка шахматного хода у {user.id}: {e}", exc_info=True)
+        # откатываем доску до состояния перед этим сообщением, чтобы партия не сломалась
+        while len(game.board.move_stack) > stack_len:
+            game.board.pop()
+        try:
+            await msg.reply_text("Что-то сломалось на моей стороне. Повтори свой ход, пожалуйста.")
+        except TelegramError:
+            pass
+        return True
+    finally:
+        game.busy = False
+
+
+# ==================== ШАХМАТЫ В ГРУППЕ: ИГРОК ПРОТИВ ИГРОКА ====================
+# Нейронка здесь не участвует вообще. Одна активная партия на чат; состояние в памяти бота.
+pvp_games: dict[int, "chess_game.PvpGame"] = {}      # chat_id -> партия
+pvp_challenges: dict[str, dict] = {}                  # challenge_id -> вызов, ждущий ответа
+
+
+def _pvp_get_game(chat_id: int):
+    game = pvp_games.get(chat_id)
+    if game and game.is_expired():
+        pvp_games.pop(chat_id, None)
+        return None
+    return game
+
+
+def _mention(user_id: int, name: str) -> str:
+    return f'<a href="tg://user?id={user_id}">{_html_escape(name or "участник")}</a>'
+
+
+def _pvp_board_html(game) -> str:
+    return f"<pre>{_html_escape(chess_game.render_board(game.board, chess.WHITE))}</pre>"
+
+
+def _pvp_result_line(game, result) -> str:
+    winner, reason = result
+    if winner is None:
+        return f"Партия окончена: {reason}. Ничья."
+    wid, wname = game.player(winner)
+    return f"Партия окончена: {reason}. Победил(а) {_mention(wid, wname)}."
+
+
+def _purge_old_pvp_challenges():
+    now = datetime.datetime.now(datetime.UTC)
+    limit = datetime.timedelta(minutes=chess_game.PVP_CHALLENGE_TTL_MINUTES)
+    for cid in [c for c, ch in pvp_challenges.items() if now - ch['created'] > limit]:
+        pvp_challenges.pop(cid, None)
+
+
+@rate_limit()
+async def chess_pvp_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/chess_pvp — вызвать на партию: ответом на сообщение, по @username (из базы бота) или открытый вызов."""
+    msg = update.message
+    user = update.effective_user
+    if not msg or not user:
+        return
+    if update.effective_chat.type not in ('group', 'supergroup'):
+        await msg.reply_text("Партия с другим участником играется в группе. В личке можно сыграть со мной: /chess.")
+        return
+
+    chat_id = update.effective_chat.id
+    if _pvp_get_game(chat_id):
+        await msg.reply_text("В этом чате уже идёт партия. Дождитесь конца или остановите её командой /chess_stop.")
+        return
+
+    target_id = None
+    target_name = None
+    reply = msg.reply_to_message
+    if reply and reply.from_user:
+        if reply.from_user.is_bot:
+            await msg.reply_text("С ботами в PvP не играю. Против меня — /chess в личных сообщениях.")
+            return
+        target_id, target_name = reply.from_user.id, reply.from_user.full_name
+    else:
+        for ent in (msg.entities or []):
+            if ent.type == 'text_mention' and ent.user and not ent.user.is_bot:
+                target_id, target_name = ent.user.id, ent.user.full_name
+                break
+        if target_id is None and context.args:
+            arg = context.args[0].lstrip('@').strip()
+            if arg:
+                from sqlalchemy import func
+                session = SessionLocal()
+                try:
+                    row = session.query(User).filter(func.lower(User.username) == arg.lower()).first()
+                    if row:
+                        target_id, target_name = row.id, f"@{row.username}"
+                finally:
+                    session.close()
+                if target_id is None:
+                    await msg.reply_text(
+                        "Не знаю такого участника (он должен хотя бы раз написать боту /start). "
+                        "Ответь командой на его сообщение или отправь /chess_pvp без аргументов — "
+                        "это открытый вызов, принять его сможет любой."
+                    )
+                    return
+
+    if target_id == user.id:
+        await msg.reply_text("С самим собой играть нечестно — ты же знаешь все свои мысли. Найди соперника.")
+        return
+
+    _purge_old_pvp_challenges()
+    cid = uuid.uuid4().hex[:10]
+    who = _mention(target_id, target_name) if target_id else "любого желающего"
+    sent = await msg.reply_text(
+        f"{_mention(user.id, user.full_name)} вызывает {who} на шахматную партию.",
+        parse_mode='HTML',
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("Принять", callback_data=f"chesspvp_accept_{cid}"),
+            InlineKeyboardButton("Отмена", callback_data=f"chesspvp_cancel_{cid}"),
+        ]])
+    )
+    pvp_challenges[cid] = {
+        'chat_id': chat_id,
+        'challenger_id': user.id,
+        'challenger_name': user.full_name,
+        'target_id': target_id,
+        'target_name': target_name,
+        'message_id': sent.message_id,
+        'created': datetime.datetime.now(datetime.UTC),
+    }
+
+
+async def chess_pvp_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    user = query.from_user
+    parts = (query.data or "").split('_', 2)
+    if len(parts) < 3:
+        await query.answer()
+        return
+    action, cid = parts[1], parts[2]
+
+    _purge_old_pvp_challenges()
+    ch = pvp_challenges.get(cid)
+    if not ch:
+        await query.answer("Вызов устарел.", show_alert=True)
+        try:
+            await query.edit_message_reply_markup(reply_markup=None)
+        except TelegramError:
+            pass
+        return
+
+    if action == 'cancel':
+        if user.id not in (ch['challenger_id'], ch['target_id']):
+            await query.answer("Это не твой вызов.", show_alert=True)
+            return
+        pvp_challenges.pop(cid, None)
+        await query.answer()
+        try:
+            await query.edit_message_text("Вызов отменён.")
+        except TelegramError:
+            pass
+        return
+
+    if action != 'accept':
+        await query.answer()
+        return
+
+    if user.id == ch['challenger_id']:
+        await query.answer("Нельзя принять собственный вызов.", show_alert=True)
+        return
+    if ch['target_id'] and user.id != ch['target_id']:
+        await query.answer("Этот вызов адресован другому игроку.", show_alert=True)
+        return
+    if user.is_bot:
+        await query.answer()
+        return
+
+    chat_id = ch['chat_id']
+    if _pvp_get_game(chat_id):
+        pvp_challenges.pop(cid, None)
+        await query.answer("В этом чате уже идёт партия.", show_alert=True)
+        try:
+            await query.edit_message_text("Вызов не принят: в чате уже идёт другая партия.")
+        except TelegramError:
+            pass
+        return
+
+    pvp_challenges.pop(cid, None)
+    players = [(ch['challenger_id'], ch['challenger_name']), (user.id, user.full_name)]
+    random.shuffle(players)
+    (wid, wname), (bid, bname) = players
+    game = chess_game.PvpGame(chat_id, wid, wname, bid, bname)
+    pvp_games[chat_id] = game
+
+    await query.answer()
+    try:
+        await query.edit_message_text(
+            f"{_mention(user.id, user.full_name)} принял вызов — партия начинается!", parse_mode='HTML'
+        )
+    except TelegramError:
+        pass
+    await context.bot.send_message(
+        chat_id=chat_id,
+        text=(
+            f"<b>Шахматы</b>\n"
+            f"Белые: {_mention(wid, wname)}\n"
+            f"Чёрные: {_mention(bid, bname)}\n\n"
+            f"{_pvp_board_html(game)}\n\n"
+            f"Ходит {_mention(wid, wname)}.\n\n"
+            f"{CHESS_INPUT_RULES}\n\n"
+            "Ход можно писать обычным сообщением или командой <code>/move e4</code> "
+            "(команда работает всегда, даже если бот не видит сообщения). "
+            "Ничья: /chess_draw. Сдаться: /chess_stop."
+        ),
+        parse_mode='HTML'
+    )
+
+
+async def _pvp_try_move(update: Update, context: ContextTypes.DEFAULT_TYPE, game, text: str, announce_errors: bool) -> bool:
+    """Пытается сделать ход игрока. True — ход сделан. Если announce_errors=False (обычные сообщения
+    в чате), любые «не ход» молча игнорируются, чтобы бот не лез в разговор."""
+    msg = update.message
+    user = update.effective_user
+    color = game.color_of(user.id)
+    if color is None:
+        if announce_errors:
+            await msg.reply_text("Ты не участвуешь в этой партии.")
+        return False
+    if game.board.turn != color:
+        if announce_errors:
+            oid, oname = game.player(game.board.turn)
+            await msg.reply_text(f"Сейчас ходит {_mention(oid, oname)}.", parse_mode='HTML')
+        return False
+
+    move, _ = chess_game.parse_message(game.board, text)
+    if move is None:
+        if announce_errors:
+            await msg.reply_text(
+                "Такого хода нет — запись неверная или он нелегален.\n"
+                f"Доступные ходы: {chess_game.legal_moves_san(game.board)}"
+            )
+        return False
+
+    san = game.board.san(move)
+    game.board.push(move)
+    game.draw_offer_by = None
+    game.touch()
+
+    result = chess_game.pvp_result(game)
+    if result:
+        footer = _pvp_result_line(game, result)
+        pvp_games.pop(game.chat_id, None)
+    else:
+        nid, nname = game.player(game.board.turn)
+        footer = f"Ходит {_mention(nid, nname)}." + (" Шах!" if game.board.is_check() else "")
+
+    await msg.reply_text(
+        f"{_mention(user.id, user.full_name)}: <b>{_html_escape(san)}</b>\n\n{_pvp_board_html(game)}\n\n{footer}",
+        parse_mode='HTML'
+    )
+    return True
+
+
+async def handle_pvp_text_move(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    """Вызывается из handle_all_text для групповых сообщений. True — сообщение было ходом в партии."""
+    msg = update.message
+    user = update.effective_user
+    if not msg or not msg.text or not user:
+        return False
+    game = _pvp_get_game(update.effective_chat.id)
+    if not game or game.color_of(user.id) is None:
+        return False
+    text = msg.text.strip()
+    if not text or len(text) > 200:
+        return False
+    return await _pvp_try_move(update, context, game, text, announce_errors=False)
+
+
+@rate_limit()
+async def chess_move_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.message
+    user = update.effective_user
+    if not msg or not user:
+        return
+    if update.effective_chat.type not in ('group', 'supergroup'):
+        await msg.reply_text("Команда /move нужна для партии двух участников в группе. В партии со мной ходы просто пиши текстом.")
+        return
+    game = _pvp_get_game(update.effective_chat.id)
+    if not game:
+        await msg.reply_text("В этом чате нет активной партии. Начать: /chess_pvp")
+        return
+    text = " ".join(context.args or []).strip()
+    if not text:
+        await msg.reply_text("Использование: /move e4 (или Nf3, O-O, e2e4).")
+        return
+    await _pvp_try_move(update, context, game, text, announce_errors=True)
+
+
+@rate_limit()
+async def chess_draw_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.message
+    user = update.effective_user
+    if not msg or not user:
+        return
+    if update.effective_chat.type not in ('group', 'supergroup'):
+        await msg.reply_text("Ничью можно предложить в партии двух участников в группе.")
+        return
+    game = _pvp_get_game(update.effective_chat.id)
+    if not game:
+        await msg.reply_text("В этом чате нет активной партии.")
+        return
+    if game.color_of(user.id) is None:
+        await msg.reply_text("Ты не участвуешь в этой партии.")
+        return
+
+    if game.draw_offer_by is None:
+        game.draw_offer_by = user.id
+        game.touch()
+        oid, oname = game.opponent_of(user.id)
+        await msg.reply_text(
+            f"{_mention(user.id, user.full_name)} предлагает ничью. "
+            f"{_mention(oid, oname)}, согласен(на) — напиши /chess_draw. Любой ход отменяет предложение.",
+            parse_mode='HTML'
+        )
+    elif game.draw_offer_by == user.id:
+        await msg.reply_text("Ты уже предложил ничью — жди ответа соперника.")
+    else:
+        pvp_games.pop(game.chat_id, None)
+        await msg.reply_text(
+            f"Ничья по соглашению игроков.\n\n{_pvp_board_html(game)}", parse_mode='HTML'
+        )
+
+
 # ==================== ТЕСТОВЫЙ ТАЙМЕР (для админов) ====================
 TIMER_TEST_DURATION_SECONDS = 120   # таймер сам завершается через 2 минуты
 TIMER_TICK_SECONDS = 1.0            # как часто обновляется сообщение
@@ -4607,7 +5209,7 @@ async def handle_all_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = user.id
     chat_id = update.effective_chat.id
 
-    if pending_reject_comments.get(user_id) and update.message and update.message.text and not update.message.text.startswith('/'):
+    if update.effective_chat.type == 'private' and pending_reject_comments.get(user_id) and update.message and update.message.text and not update.message.text.startswith('/'):
         entry = take_next_reject_comment_entry(user_id)
         if entry:
             comment_text = update.message.text.strip()
@@ -4619,11 +5221,25 @@ async def handle_all_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await update.message.reply_text("Не получилось отправить комментарий автору анкеты (см. лог).")
             return
 
-    if await sorol_collect(update, context):
+    # Ход в шахматной партии двух участников в группе (нейронка в этом не участвует).
+    if update.effective_chat.type in ('group', 'supergroup') and update.effective_chat.id in pvp_games:
+        if await handle_pvp_text_move(update, context):
+            return
+
+    # Сбор ответа на /sorol_add — только в личке (user_data общий для всех чатов пользователя).
+    if update.effective_chat.type == 'private' and await sorol_collect(update, context):
         return
 
     if is_user_banned_from_ai(user_id):
-        asyncio.create_task(animate_grudge_ban(update.message, context, user_id))
+        # В группах реагируем на бан только если обратились именно к боту, а не на любое сообщение.
+        if update.effective_chat.type == 'private' or (
+            update.message and (
+                _is_bot_mentioned(update.message, context)
+                or bool(update.message.reply_to_message and update.message.reply_to_message.from_user
+                        and update.message.reply_to_message.from_user.id == context.bot.id)
+            )
+        ):
+            asyncio.create_task(animate_grudge_ban(update.message, context, user_id))
         return
 
     if update.effective_chat.type != 'private' and update.effective_chat.id not in ALLOWED_CHAT_IDS:
@@ -4644,7 +5260,7 @@ async def handle_all_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             context.user_data.pop('anketa_items', None)
             await update.message.reply_text("Системный сбой: сбор анкеты прерван.")
 
-    if context.user_data.get('anketa_step') == 'collecting':
+    if update.effective_chat.type == 'private' and context.user_data.get('anketa_step') == 'collecting':
         await anketa_collect(update, context)
         return
 
@@ -4660,6 +5276,11 @@ async def handle_all_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if user_animation_lock.get(user_id):
         return
+
+    # Идёт шахматная партия — сообщения в личке трактуются как ходы/реплики по партии.
+    if update.effective_chat.type == 'private' and user_id in chess_games:
+        if await handle_chess_message(update, context):
+            return
 
     # В групповых RP-чатах (ALLOWED_CHAT_IDS) нейронка отвечает только если её позвали:
     # либо явное @упоминание, либо прямой reply на её собственное сообщение
@@ -4696,7 +5317,8 @@ async def media_collector(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message:
         return
 
-    if update.effective_chat.type != 'private' and update.effective_chat.id not in ALLOWED_CHAT_IDS:
+    # Медиа нужно только для сбора анкеты, а он идёт в личке; в группах бот на медиа не реагирует.
+    if update.effective_chat.type != 'private':
         return
 
     if update.message.date:
@@ -4707,7 +5329,7 @@ async def media_collector(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     user_id = update.effective_user.id
     if is_user_banned_from_ai(user_id):
-        await animate_grudge_ban(update, context, user_id)
+        await animate_grudge_ban(update.message, context, user_id)
         return
     if is_zoom_active(user_id):
         if context.user_data.get('anketa_step') == 'collecting':
@@ -4720,7 +5342,17 @@ async def media_collector(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await anketa_collect(update, context)
 
 async def unknown(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Такой команды не существует. Загляни в /help, если совсем потерялся.")
+    msg = update.message
+    if not msg:
+        return
+    if update.effective_chat.type != 'private':
+        # В группах отвечаем только на неизвестные команды, адресованные именно этому боту (/cmd@бот):
+        # остальные скорее всего предназначены другим ботам чата.
+        first = (msg.text or "").split()[0] if msg.text else ""
+        bot_username = (context.bot.username or "").lower()
+        if "@" not in first or first.split("@", 1)[1].lower() != bot_username:
+            return
+    await msg.reply_text("Такой команды не существует. Загляни в /help, если совсем потерялся.")
 
 # ==================== ОЧИСТКА ФАКТОВ О НЕАКТИВНЫХ ПОЛЬЗОВАТЕЛЯХ ====================
 INACTIVE_DAYS_THRESHOLD = 60
@@ -4773,6 +5405,7 @@ def cleanup_inactive_memory():
             user_anketa_dispute.pop(uid, None)
             user_animation_lock.pop(uid, None)
             user_last_command.pop(uid, None)
+            chess_games.pop(uid, None)
 
             for chat_id, users_set in expected_newcomers.items():
                 users_set.discard(uid)
@@ -4873,6 +5506,12 @@ async def set_commands(application: Application):
         BotCommand("sorol_add", "Подать заявку: ищу сорола"),
         BotCommand("sorol_list", "Список ищущих сорола"),
         BotCommand("sorol_remove", "Снять свою заявку"),
+        # Шахматы
+        BotCommand("chess", "Сыграть в шахматы с Амадеусом"),
+        BotCommand("chess_stop", "Сдаться / закончить шахматную партию"),
+        BotCommand("chess_pvp", "Шахматы с другим участником (в группе)"),
+        BotCommand("move", "Сделать ход в партии в группе: /move e4"),
+        BotCommand("chess_draw", "Предложить ничью / согласиться (в группе)"),
     ]
     await application.bot.set_my_commands(public_commands, scope=BotCommandScopeDefault())
 
@@ -5008,6 +5647,13 @@ def main():
     application.add_handler(CommandHandler("sorol_add", sorol_add))
     application.add_handler(CommandHandler("sorol_list", sorol_list))
     application.add_handler(CommandHandler("sorol_remove", sorol_remove))
+    # Шахматы
+    application.add_handler(CommandHandler("chess", chess_command))
+    application.add_handler(CommandHandler("chess_stop", chess_stop))
+    application.add_handler(CommandHandler("chess_pvp", chess_pvp_command))
+    application.add_handler(CommandHandler("move", chess_move_command))
+    application.add_handler(CommandHandler("chess_draw", chess_draw_command))
+    application.add_handler(CallbackQueryHandler(chess_pvp_callback, pattern="^chesspvp_"))
 
     application.add_handler(CallbackQueryHandler(anketa_dispute_callback, pattern="^anketa_dispute_"))
     application.add_handler(CallbackQueryHandler(anketa_reject_comment_callback, pattern="^anketa_rejcomment_"))
