@@ -16,7 +16,10 @@ load_dotenv()
 
 from sqlalchemy import create_engine, Column, Integer, String, Text, Boolean, DateTime, Date, ForeignKey, BigInteger, inspect, text
 from sqlalchemy import String as SQLA_String
-from sqlalchemy.orm import sessionmaker, relationship, declarative_base
+from sqlalchemy import event
+from sqlalchemy.exc import OperationalError, InterfaceError, InternalError, ProgrammingError, DBAPIError
+from sqlalchemy.pool import StaticPool
+from sqlalchemy.orm import Session, sessionmaker, relationship, declarative_base
 from sqlalchemy.types import TypeDecorator
 
 from telegram import Update, Message, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand, BotCommandScopeDefault, BotCommandScopeChat, InputMediaPhoto, InputMediaVideo, InputMediaDocument
@@ -54,6 +57,13 @@ DEVELOPER_IDS = [int(x) for x in os.getenv('DEVELOPER_IDS', '5150559970').split(
 ANKET_CHANNEL_ID = int(os.getenv('ANKET_CHANNEL_ID', '-1003394079022'))
 BACKUP_ANKET_CHANNEL_ID = int(os.getenv('BACKUP_ANKET_CHANNEL_ID', '0'))
 ANKETA_COOLDOWN_MINUTES = 30
+# Ссылка на правила заполнения анкеты. Пока пусто — блок с правилами в /anketa не показывается.
+# Когда появится ссылка, просто впиши её сюда.
+ANKETA_RULES_LINK = ""
+ANKETA_RULES_NOTICE = (
+    f"Перед началом ознакомься с правилами заполнения анкеты: {ANKETA_RULES_LINK}\n\n"
+    if ANKETA_RULES_LINK else ""
+)
 MAX_PENDING_ANKETAS_PER_USER = 2  # сколько анкет одновременно может висеть на рассмотрении у одного участника
 # Порог длины анкеты, после которого обязательна ссылка на Telegraph — больше одного сообщения Telegram (4096),
 # но меньше двух (8192).
@@ -98,15 +108,94 @@ logger = logging.getLogger(__name__)
 # ==================== БАЗА ДАННЫХ ====================
 DATABASE_URL = os.getenv('DATABASE_URL', '').replace('postgres://', 'postgresql://')
 
-if DATABASE_URL:
-    engine = create_engine(DATABASE_URL, pool_pre_ping=True, pool_recycle=300)
-    logger.info("Используется PostgreSQL база данных")
-else:
-    engine = create_engine(f"sqlite:///{DB_NAME}", connect_args={"check_same_thread": False})
-    logger.info("Используется локальная SQLite база данных")
+# Основная БД (PostgreSQL по DATABASE_URL, иначе локальный SQLite-файл) + резервная БД в памяти.
+# Если основная недоступна (например, забыли создать новую БД), бот автоматически работает на
+# резервной: данные хранятся только в памяти бота и нигде больше не сохраняются. Фоновая проверка
+# сама вернёт бота на основную БД, как только она заработает (в том числе пустая — таблицы создаст).
+# DB_FORCE_MEMORY=1 в .env — принудительно работать только в памяти, не трогая основную БД.
+fallback_engine = create_engine(
+    "sqlite://",
+    connect_args={"check_same_thread": False},
+    poolclass=StaticPool,
+)
+
+DB_FORCE_MEMORY = os.getenv('DB_FORCE_MEMORY', '').strip().lower() in ('1', 'true', 'yes', 'on')
+
+try:
+    if DB_FORCE_MEMORY:
+        primary_engine = fallback_engine
+        logger.info("DB_FORCE_MEMORY: БД отключена, все данные хранятся только в памяти бота")
+    elif DATABASE_URL:
+        _primary_kwargs = dict(pool_pre_ping=True, pool_recycle=300, pool_timeout=10)
+        if DATABASE_URL.startswith("postgresql"):
+            _primary_kwargs["connect_args"] = {"connect_timeout": 5}
+        primary_engine = create_engine(DATABASE_URL, **_primary_kwargs)
+        logger.info("Используется PostgreSQL база данных")
+    else:
+        primary_engine = create_engine(f"sqlite:///{DB_NAME}", connect_args={"check_same_thread": False})
+        logger.info("Используется локальная SQLite база данных")
+except Exception as _engine_err:
+    # Невалидный DATABASE_URL или не установлен драйвер — бот всё равно запускается, но только на памяти.
+    logger.error(f"Не удалось создать подключение к основной БД ({_engine_err}). Работаю только в памяти.")
+    primary_engine = fallback_engine
+
+engine = primary_engine  # для функций миграции и совместимости
+
+DB_HEALTH_INTERVAL_SECONDS = 20       # пока основная БД работает
+DB_HEALTH_RETRY_DOWN_SECONDS = 60      # пока недоступна — проверяем реже
+_db_state = {"primary_ok": True, "down_since": None}
+
+def _mark_primary_down(error=None):
+    if _db_state["primary_ok"]:
+        _db_state["primary_ok"] = False
+        _db_state["down_since"] = datetime.datetime.now()
+        logger.error(f"Основная БД недоступна, перехожу на резервную (в памяти): {error}")
+
+_SCHEMA_MISSING_MARKERS = ("does not exist", "no such table", "undefined table", "no such column", "undefined column")
+
+def _is_primary_failure(exc) -> bool:
+    """Ошибка, после которой основную БД надо считать недоступной: обрыв соединения,
+    выключенный сервер, неверные доступы, а также пустая/пересозданная БД без таблиц."""
+    if isinstance(exc, (OperationalError, InterfaceError, InternalError)):
+        return True
+    if isinstance(exc, ProgrammingError):
+        return any(m in str(exc).lower() for m in _SCHEMA_MISSING_MARKERS)
+    return False
+
+if primary_engine is not fallback_engine:
+    @event.listens_for(primary_engine, "handle_error")
+    def _on_primary_db_error(ctx):
+        exc = ctx.sqlalchemy_exception
+        if ctx.is_disconnect or _is_primary_failure(exc):
+            _mark_primary_down(exc or ctx.original_exception)
+
+class ResilientSession(Session):
+    """Сессия, которая работает с основной БД, а при её недоступности прозрачно
+    переключается на резервную. Выбор БД фиксируется при создании сессии."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._use_primary = _db_state["primary_ok"] and primary_engine is not fallback_engine
+
+    def get_bind(self, *args, **kwargs):
+        return primary_engine if self._use_primary else fallback_engine
+
+    def execute(self, *args, **kwargs):
+        try:
+            return super().execute(*args, **kwargs)
+        except DBAPIError as e:
+            if not self._use_primary or not _is_primary_failure(e):
+                raise
+            _mark_primary_down(e)
+            self._use_primary = False
+            try:
+                self.rollback()
+            except Exception:
+                pass
+            return super().execute(*args, **kwargs)
 
 Base = declarative_base()
-SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+SessionLocal = sessionmaker(class_=ResilientSession, autocommit=False, autoflush=False)
 
 # ==================== КАСТОМНЫЕ ТИПЫ ДЛЯ БД ====================
 class StringList(TypeDecorator):
@@ -122,21 +211,24 @@ class StringList(TypeDecorator):
         value = [str(item) if item is not None else '' for item in value]
         return json.dumps(value, ensure_ascii=False)
 
-    def process_result_param(self, value, dialect):
+    def process_result_value(self, value, dialect):
         if value is None:
             return []
         try:
             deserialized_value = json.loads(value)
-            if isinstance(deserialized_value, list):
-                return deserialized_value
-            else:
+            if not isinstance(deserialized_value, list):
                 logger.warning(f"StringList expected a JSON list, but got type {type(deserialized_value)} for value '{value}'. Returning empty list.")
                 return []
+            # Старый баг записывал в БД мусор: список из одиночных символов вместо фактов.
+            # Такие записи считаем пустыми, чтобы они не попадали в промпт и не копились дальше.
+            if deserialized_value and all(isinstance(i, str) and len(i) <= 1 for i in deserialized_value):
+                return []
+            return deserialized_value
         except json.JSONDecodeError:
             logger.error(f"StringList failed to JSON decode value: '{value}'. Returning empty list.", exc_info=True)
             return []
         except Exception as e:
-            logger.error(f"Unexpected error in StringList process_result_param for value '{value}': {e}. Returning empty list.", exc_info=True)
+            logger.error(f"Unexpected error in StringList process_result_value for value '{value}': {e}. Returning empty list.", exc_info=True)
             return []
 
 # ==================== МОДЕЛИ БД ====================
@@ -237,7 +329,7 @@ class SorolSeeker(Base):
 
 # ==================== СОЗДАНИЕ ТАБЛИЦ ====================
 def create_tables():
-    Base.metadata.create_all(bind=engine)
+    Base.metadata.create_all(bind=primary_engine)
     logger.info("Таблицы базы данных созданы или уже существуют.")
 
 def add_zoom_flag_column():
@@ -253,6 +345,28 @@ def add_zoom_flag_column():
                 logger.warning(f"Неизвестный диалект {engine.dialect.name}, колонка не добавлена автоматически.")
             conn.commit()
         logger.info("Добавлена колонка has_experienced_zoom в таблицу users.")
+
+def _ping_primary() -> bool:
+    try:
+        with primary_engine.connect() as conn:
+            conn.execute(text("SELECT 1"))
+        return True
+    except Exception:
+        return False
+
+def _prepare_primary():
+    """Создаёт таблицы и применяет миграции колонок в основной БД."""
+    create_tables()
+    add_zoom_flag_column()
+    add_trust_level_column()
+
+def init_database():
+    # Резервная БД нужна всегда — на случай, если основная упадёт в любой момент.
+    Base.metadata.create_all(bind=fallback_engine)
+    try:
+        _prepare_primary()
+    except Exception as e:
+        _mark_primary_down(e)
 
 def add_trust_level_column():
     inspector = inspect(engine)
@@ -453,7 +567,13 @@ def check_spam_and_ban(user_id: int) -> tuple[bool, Optional[int]]:
     return True, None
 
 # ==================== СТИКЕРЫ / ЭМОЦИИ ====================
-STICKER_START = "CAACAgIAAxkBA4REUmqUe0IdFodZ1coLrqjDUh9RJzYVAAKGPAAC9-4YSEtJtxBKQ7xVPQQ"
+STICKER_START_VARIANTS = [
+    "CAACAgIAAxkBA4REUmqUe0IdFodZ1coLrqjDUh9RJzYVAAKGPAAC9-4YSEtJtxBKQ7xVPQQ",
+    "CAACAgIAAxkBA6BtT2rKATTMgjnIfXelvKsywQuD_6LMAAIoMwACw4EZSJbB0ndFhv9sPQQ",
+]
+STICKER_START = STICKER_START_VARIANTS[0]  # для совместимости; при появлении выбирается случайный из списка
+# Прощальный стикер (махание рукой) — отправляется при завершении RP.
+STICKER_FAREWELL = "CAACAgIAAxkBA6BtRGrKARfOWdtIfeb-Hmgdkt2lzjNJAAJYOwACYjoZSMeDQQz_WjzpPQQ"
 STICKER_ANKETA_APPROVE = "CAACAgIAAxkBA4RElmqUe8mk6x9SaBuQbEFFe_tvgj3QAAJBNwACrfUYSDxPZtxw3ZyAPQQ"
 
 STICKER_EMOTIONS = {
@@ -582,7 +702,7 @@ async def maybe_send_rofl_sticker(bot, chat_id: int, username: Optional[str]) ->
 
 async def send_emotion_sticker(bot, chat_id: int, emotion_key: Optional[str], zoom_stage: Optional[str] = None, user_id: Optional[int] = None):
     key = user_id if user_id is not None else chat_id
-    if user_grudge_level.get(key) == 4:
+    if ZOOM_ENABLED and user_grudge_level.get(key) == 4:
         count = user_zoom_sticker_counters.get(key, 0) + 1
         if count < ZOOM_STICKER_EVERY:
             user_zoom_sticker_counters[key] = count
@@ -714,6 +834,10 @@ async def end_rp(user_id: int, bot, chat_id: int, reason: str = "Ролевая 
         user_rp_mode[user_id] = 'inactive'
         user_rp_data.pop(user_id, None)
         await bot.send_message(chat_id=chat_id, text=f"{reason}")
+        try:
+            await bot.send_sticker(chat_id=chat_id, sticker=STICKER_FAREWELL)
+        except TelegramError as e:
+            logger.warning(f"Не удалось отправить прощальный стикер: {e}")
         logger.info(f"RP завершен для {user_id}: {reason}")
 
 # ==================== ЭКСТРАКТОР RP-ФАКТОВ ====================
@@ -980,6 +1104,9 @@ user_grudge_last_increase_at: dict[int, int] = {}
 
 GRUDGE_ZOOM_ESCALATION_MESSAGES = 6
 user_grudge_high_streak: dict[int, int] = {}
+# Главный переключатель: Зум полностью отключён. Обида не поднимается выше 3,
+# режим захвата, анимации, стикеры/видео Зума и тестовые команды недоступны.
+ZOOM_ENABLED = False
 GROUP_GRUDGE_CAP = 3  # В группах обида не растёт выше этого — эскалация в "Зум" там отключена.
 
 def _user_has_experienced_zoom(user_id: int) -> bool:
@@ -1078,6 +1205,12 @@ def update_user_grudge(user_id: int, new_level: Optional[int], allow_zoom_escala
     user_grudge_msg_counter[user_id] = msg_count
 
     current = user_grudge_level.get(user_id, 0)
+
+    if not ZOOM_ENABLED:
+        allow_zoom_escalation = False
+        if current >= 4:
+            current = GROUP_GRUDGE_CAP
+            user_grudge_level[user_id] = current
 
     if new_level is not None:
         if current == 4:
@@ -1239,7 +1372,7 @@ async def generate_ban_comment(user_id: int):
         user_grudge_ban_comment[user_id] = "Амадеус отказалась от общения. Попробуйте позже."
 
 def is_zoom_active(user_id: int) -> bool:
-    return user_grudge_level.get(user_id) == 4
+    return ZOOM_ENABLED and user_grudge_level.get(user_id) == 4
 
 def is_user_banned_from_ai(user_id: int) -> bool:
     until = user_grudge_ban_until.get(user_id)
@@ -1583,6 +1716,7 @@ async def process_ai_response(message, context, text: str, user_id: int, first_n
     # накопилась обида 4 (например, из личных сообщений), в группе она не проявляется.
     zoom_mode = is_zoom_active(user_id) and not is_group
     rp_active = user_rp_mode.get(user_id) in ('negotiate', 'active')
+    rp_ended_now = False
 
     # Анимация вывода оставлена только для сюжетного режима "Зум" (взлом/глюк) —
     # обычная и RP-анимация набора текста убрана по требованию.
@@ -1622,6 +1756,7 @@ async def process_ai_response(message, context, text: str, user_id: int, first_n
             }
         elif rp_mode in ('inactive', 'ending'):
             user_rp_data.pop(user_id, None)
+            rp_ended_now = True
             
             # Уведомление только разработчикам
             if rp_mode == 'ending':
@@ -1689,6 +1824,13 @@ async def process_ai_response(message, context, text: str, user_id: int, first_n
                     await send_emotion_sticker(context.bot, chat_id, emotion_key, zoom_stage, user_id=user_id)
             else:
                 await send_emotion_sticker(context.bot, chat_id, emotion_key, zoom_stage, user_id=user_id)
+
+    # Прощальный стикер при завершении RP (после текстового ответа)
+    if rp_ended_now and not skip_reply:
+        try:
+            await context.bot.send_sticker(chat_id=chat_id, sticker=STICKER_FAREWELL)
+        except TelegramError as e:
+            logger.warning(f"Не удалось отправить прощальный стикер: {e}")
 
     # Проверка бана за обиду
     if grudge_level is not None and grudge_level == 3:
@@ -1810,7 +1952,9 @@ def build_anketa_extra_context(user_text: str) -> Optional[str]:
 # ==================== ПОСТРОЕНИЕ СИСТЕМНОГО ПРОМПТА (с RP) ====================
 def build_system_prompt(user_id: int, first_name: Optional[str] = None, extra_context: Optional[str] = None, chat_id: Optional[int] = None, is_group: bool = False) -> str:
     grudge_level = user_grudge_level.get(user_id, 0)
-    if grudge_level == 4 and not is_group:
+    if not ZOOM_ENABLED:
+        grudge_level = min(grudge_level, GROUP_GRUDGE_CAP)
+    if ZOOM_ENABLED and grudge_level == 4 and not is_group:
         cross = get_cross_chat_context(user_id, chat_id, limit=3)
         return SYSTEM_PROMPT_ZOOM_VIRUS + "\n\n" + cross if cross else SYSTEM_PROMPT_ZOOM_VIRUS
     if is_group:
@@ -2435,7 +2579,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text(greeting)
     try:
-        await context.bot.send_sticker(chat_id=update.effective_chat.id, sticker=STICKER_START)
+        await context.bot.send_sticker(chat_id=update.effective_chat.id, sticker=random.choice(STICKER_START_VARIANTS))
     except TelegramError as e:
         logger.warning(f"Не удалось отправить стартовый стикер: {e}")
 
@@ -3018,8 +3162,7 @@ async def anketa(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text(
         "<b>Создание анкеты</b>\n\n"
-        "Перед началом ознакомься с правилами заполнения анкеты: "
-        "https://telegra.ph/Pravila-vvedyonnye-s-prihodom-Drimki-na-dolzhnost-gubernatora-anketnicy-06-08\n\n"
+        f"{ANKETA_RULES_NOTICE}"
         "Отправляй части анкеты по очереди. Можно использовать текст, фото, видео, GIF, документы.\n\n"
         "Когда закончишь, напиши:\n"
         "<code>/send_anketa</code> — для отправки на модерацию\n"
@@ -3076,8 +3219,10 @@ async def anketa_collect(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Сохраняем оформление Telegram (цитаты, жирный, курсив, спойлеры, моно, ссылки и т.д.)
     if item["type"] == "text":
         item["entities"] = list(update.message.entities or [])
+        item["html"] = update.message.text_html
     else:
         item["entities"] = list(update.message.caption_entities or [])
+        item["html"] = update.message.caption_html if update.message.caption else None
 
     context.user_data['anketa_items'].append(item)
     total = len(context.user_data['anketa_items'])
@@ -3127,20 +3272,36 @@ async def forward_anketa_item(bot, chat_id: int, item: dict):
         except TelegramError as e:
             logger.warning(f"copy_message не сработал ({e}), пробую отправить с entities")
 
-    # Запасной способ: по file_id / тексту с сохранёнными entities (без parse_mode!)
-    text = item.get("text") or None
-    entities = item.get("entities") or None
+    # Запасной способ: по file_id / тексту с сохранёнными entities (без parse_mode!),
+    # а если и он не сработал — по сохранённому HTML-оформлению.
     t = item["type"]
-    if t == "text":
-        await bot.send_message(chat_id=chat_id, text=item["text"], entities=entities)
-    elif t == "photo":
-        await bot.send_photo(chat_id=chat_id, photo=item["file_id"], caption=text, caption_entities=entities)
-    elif t == "video":
-        await bot.send_video(chat_id=chat_id, video=item["file_id"], caption=text, caption_entities=entities)
-    elif t == "animation":
-        await bot.send_animation(chat_id=chat_id, animation=item["file_id"], caption=text, caption_entities=entities)
-    elif t == "document":
-        await bot.send_document(chat_id=chat_id, document=item["file_id"], caption=text, caption_entities=entities)
+    attempts = [
+        {"text": item.get("text") or None, "kw": {"entities": item.get("entities") or None},
+         "cap_kw": {"caption_entities": item.get("entities") or None}},
+    ]
+    if item.get("html"):
+        attempts.append({"text": item["html"], "kw": {"parse_mode": "HTML"}, "cap_kw": {"parse_mode": "HTML"}})
+
+    last_error = None
+    for attempt in attempts:
+        text = attempt["text"]
+        try:
+            if t == "text":
+                await bot.send_message(chat_id=chat_id, text=item["text"] if "entities" in attempt["kw"] else text, **attempt["kw"])
+            elif t == "photo":
+                await bot.send_photo(chat_id=chat_id, photo=item["file_id"], caption=text, **attempt["cap_kw"])
+            elif t == "video":
+                await bot.send_video(chat_id=chat_id, video=item["file_id"], caption=text, **attempt["cap_kw"])
+            elif t == "animation":
+                await bot.send_animation(chat_id=chat_id, animation=item["file_id"], caption=text, **attempt["cap_kw"])
+            elif t == "document":
+                await bot.send_document(chat_id=chat_id, document=item["file_id"], caption=text, **attempt["cap_kw"])
+            return
+        except TelegramError as e:
+            logger.warning(f"Запасная отправка части анкеты не сработала ({e})")
+            last_error = e
+    if last_error:
+        raise last_error
 
 async def forward_anketa_items(bot, chat_id: int, items: list):
     """Отправляет все части анкеты по порядку. Сбой одной части не мешает остальным;
@@ -4592,11 +4753,6 @@ async def set_commands(application: Application):
         BotCommand("addanketnik", "Назначить анкетника"),
         BotCommand("resetcd", "Обнулить кулдаун на отправку анкеты у участника"),
         BotCommand("forcefacts", "Принудительно запустить извлечение фактов ИИ"),
-        BotCommand("forcezoom", "Тест: принудительно активировать режим Зума"),
-        BotCommand("addzoomclip", "Добавить видео-нарезку Зума (в память)"),
-        BotCommand("stopzoom", "Принудительно завершить режим Зума у участника"),
-        BotCommand("forcegrudge", "Тест: быстро подвести к переходу в Зум"),
-        BotCommand("resetzoomflag", "Тест: сбросить флажок 'уже пережил Зум'"),
         BotCommand("forcetrust", "Тест: выставить уровень доверия (0-5)"),
         BotCommand("resettrust", "Тест: сбросить уровень доверия в 0"),
     ]
@@ -4619,18 +4775,79 @@ async def load_anketniks():
     finally:
         session.close()
 
+_ping_in_progress = {"busy": False}
+
+def _ping_primary_guarded() -> bool:
+    try:
+        return _ping_primary()
+    finally:
+        _ping_in_progress["busy"] = False
+
+async def db_health_loop(application: Application):
+    """Следит за основной БД: уходит на резерв при падении, возвращается при восстановлении."""
+    if primary_engine is fallback_engine:
+        return  # основной БД нет (память / невалидный URL) — следить не за чем
+    last_notified_ok = True  # если БД недоступна уже при старте — разработчики получат уведомление
+    while True:
+        await asyncio.sleep(DB_HEALTH_INTERVAL_SECONDS if _db_state["primary_ok"] else DB_HEALTH_RETRY_DOWN_SECONDS)
+        try:
+            if _ping_in_progress["busy"]:
+                continue  # прошлая проверка ещё висит (например, завис DNS) — потоки не копим
+            _ping_in_progress["busy"] = True
+            try:
+                alive = await asyncio.wait_for(asyncio.to_thread(_ping_primary_guarded), timeout=20)
+            except asyncio.TimeoutError:
+                alive = False  # флаг busy снимется, только когда зависший поток реально завершится
+            if _db_state["primary_ok"] and not alive:
+                _mark_primary_down("health-check не прошёл")
+            elif not _db_state["primary_ok"] and alive:
+                await asyncio.to_thread(_prepare_primary)
+                _db_state["primary_ok"] = True
+                _db_state["down_since"] = None
+                logger.info("Основная БД снова доступна, возвращаюсь на неё.")
+                await load_anketniks()
+
+            if _db_state["primary_ok"] != last_notified_ok:
+                last_notified_ok = _db_state["primary_ok"]
+                text_msg = (
+                    "БД снова доступна, бот вернулся на основное хранилище."
+                    if last_notified_ok else
+                    "БД недоступна (возможно, пора создать новую и обновить DATABASE_URL). "
+                    "Бот работает в режиме памяти: всё продолжает работать, но данные "
+                    "пользователей хранятся только в памяти бота и пропадут при перезапуске."
+                )
+                for dev_id in DEVELOPER_IDS:
+                    try:
+                        await application.bot.send_message(chat_id=dev_id, text=text_msg)
+                    except Exception as e:
+                        logger.warning(f"Не удалось уведомить разработчика {dev_id} о состоянии БД: {e}")
+        except Exception as e:
+            logger.error(f"Ошибка в цикле проверки БД: {e}")
+
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
+    err = context.error
+    logger.error("Необработанная ошибка в обработчике", exc_info=err)
+    if _is_primary_failure(err):
+        _mark_primary_down(err)
+        if isinstance(update, Update) and update.effective_message:
+            try:
+                await update.effective_message.reply_text(
+                    "Минутная заминка с хранилищем — уже переключилась на запасной вариант. Повтори, пожалуйста."
+                )
+            except TelegramError:
+                pass
+
 async def post_init(application: Application):
     await load_anketniks() 
     await set_commands(application)
+    asyncio.create_task(db_health_loop(application))
     asyncio.create_task(cleanup_inactive_users_loop())
     asyncio.create_task(cleanup_anketa_disputes_loop())
     logger.info(f"Запущена фоновая очистка неактивных пользователей (порог: {INACTIVE_DAYS_THRESHOLD} дней).")
     logger.info("Запущена фоновая очистка просроченных споров по анкетам.")
 
 def main():
-    create_tables()
-    add_zoom_flag_column()
-    add_trust_level_column()
+    init_database()
     threading.Thread(target=run_flask, daemon=True).start()
 
     application = Application.builder().token(TOKEN).build()
@@ -4651,11 +4868,6 @@ def main():
     application.add_handler(CommandHandler("addanketnik", add_anketnik))
     application.add_handler(CommandHandler("resetcd", reset_anketa_cd))
     application.add_handler(CommandHandler("forcefacts", force_extract_facts))
-    application.add_handler(CommandHandler("forcezoom", force_zoom))
-    application.add_handler(CommandHandler("forcegrudge", force_grudge))
-    application.add_handler(CommandHandler("resetzoomflag", reset_zoom_flag))
-    application.add_handler(CommandHandler("addzoomclip", add_zoom_clip))
-    application.add_handler(CommandHandler("stopzoom", stopzoom))
     application.add_handler(CommandHandler("forcetrust", force_trust))
     application.add_handler(CommandHandler("resettrust", reset_trust))
     # RP-команды
@@ -4679,6 +4891,7 @@ def main():
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_all_text))
     application.add_handler(MessageHandler(filters.COMMAND, unknown))
 
+    application.add_error_handler(error_handler)
     application.post_init = post_init
 
     logger.info("Бот Омниверс с Амадеусом и RP-режимом запущен.")
