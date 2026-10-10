@@ -11,6 +11,15 @@ import functools
 import aiohttp
 from typing import Optional
 from collections import deque, OrderedDict
+import os, sys
+print("=== DEBUG ===")
+print("CWD:", os.getcwd())
+print("Script dir:", os.path.dirname(os.path.abspath(__file__)))
+print("Files here:", os.listdir(os.path.dirname(os.path.abspath(__file__))))
+print("sys.path:", sys.path)
+print("=============")
+
+import chess_game
 
 from dotenv import load_dotenv
 load_dotenv()
@@ -70,7 +79,7 @@ ANKETA_RULES_NOTICE = (
 MAX_PENDING_ANKETAS_PER_USER = 2  # сколько анкет одновременно может висеть на рассмотрении у одного участника
 # Порог длины анкеты, после которого обязательна ссылка на Telegraph — больше одного сообщения Telegram (4096),
 # но меньше двух (8192).
-ANKETA_MAX_CHARS_WITHOUT_LINK = 6144
+ANKETA_MAX_CHARS_WITHOUT_LINK = 6145
 
 ALLOWED_CHAT_IDS = [
     int(x) for x in os.getenv('ALLOWED_CHAT_IDS', '-1003431402721,-1003355542910,-1003300824366,-1003394079022,-1003062290367').split(',')
