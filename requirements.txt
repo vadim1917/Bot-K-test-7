@@ -5,4 +5,4 @@ flask
 python-dotenv
 psycopg2-binary
 psycopg[binary]
-chess
+chess=1.10.0
