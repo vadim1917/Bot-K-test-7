@@ -4363,52 +4363,75 @@ async def stopzoom(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ==================== ТЕСТОВЫЙ ТАЙМЕР (для админов) ====================
 TIMER_TEST_DURATION_SECONDS = 120   # таймер сам завершается через 2 минуты
 TIMER_TICK_SECONDS = 1.0            # как часто обновляется сообщение
-TIMER_SCRAMBLE_CHARS = "#$%&@!?01_-/\\<>[]{}=+*^~▓▒░█▀▄"
-TIMER_SIDE_LEN = 9                  # сколько «мусорных» символов с каждой стороны
+TIMER_BOX_INNER_WIDTH = 19          # ширина рамки внутри (между ║ и ║)
+TIMER_DANGER_SIGN = "⚠"
+TIMER_GLITCH_CHARS = "#&@%!"        # на нечётных секундах знак опасности «сбоит» на один из них
+# Полоска под таймером: клетки по очереди «зажигаются» и по ходу меняют цвет (зелёный → красный).
+TIMER_BAR_COLORS = ["🟩"] * 3 + ["🟨"] * 3 + ["🟧"] * 3 + ["🟥"] * 3
+TIMER_BAR_EMPTY = "⬛"
+TIMER_BAR_WIDTH = len(TIMER_BAR_COLORS)
 
 # chat_id -> {"stop": asyncio.Event, "task": asyncio.Task}
 active_test_timers: dict[int, dict] = {}
 
-def _scramble(length: int = TIMER_SIDE_LEN) -> str:
-    return ''.join(random.choice(TIMER_SCRAMBLE_CHARS) for _ in range(length))
-
 def format_countdown(total_seconds: int) -> str:
+    """Дни, часы, минуты, секунды: «00д 00ч 02м 00с»."""
     total_seconds = max(0, int(total_seconds))
     days, rest = divmod(total_seconds, 86400)
     hours, rest = divmod(rest, 3600)
     minutes, seconds = divmod(rest, 60)
-    return f"{days:02d} дн : {hours:02d} ч : {minutes:02d} мин : {seconds:02d} сек"
+    return f"{days:02d}д {hours:02d}ч {minutes:02d}м {seconds:02d}с"
 
-def render_timer_frame(remaining_seconds: float) -> str:
-    countdown = format_countdown(math.ceil(remaining_seconds))
-    return (
-        "ТЕСТОВЫЙ ТАЙМЕР\n\n"
-        f"{_scramble()}  {countdown}  {_scramble()}\n\n"
-        "До конца теста. Остановить: /stop"
+def render_timer_frame(remaining_seconds: float, duration: float = TIMER_TEST_DURATION_SECONDS,
+                       sign: Optional[str] = None, note: Optional[str] = None) -> str:
+    remaining_seconds = max(0.0, remaining_seconds)
+    elapsed = max(0.0, duration - remaining_seconds)
+
+    filled = round(TIMER_BAR_WIDTH * (elapsed / duration)) if duration > 0 else TIMER_BAR_WIDTH
+    filled = max(0, min(TIMER_BAR_WIDTH, filled))
+    bar = "".join(TIMER_BAR_COLORS[:filled]) + TIMER_BAR_EMPTY * (TIMER_BAR_WIDTH - filled)
+
+    if sign is None:
+        tick = int(elapsed)
+        sign = TIMER_DANGER_SIGN if tick % 2 == 0 else random.choice(TIMER_GLITCH_CHARS)
+
+    time_text = format_countdown(math.ceil(remaining_seconds)).center(TIMER_BOX_INNER_WIDTH)
+    border = "═" * TIMER_BOX_INNER_WIDTH
+    box = (
+        f"╔{border}╗\n"
+        f"║{time_text}║\n"
+        f"╚{border}╝"
     )
+    # Рамка в <pre>: пробелы сохраняются, шрифт моноширинный. Полоска из эмодзи вынесена
+    # из <pre> (у эмодзи ширина в моноширинном шрифте непредсказуема и сломала бы рамку).
+    text = f"<pre>{_html_escape(box)}</pre>\n{bar} {_html_escape(sign)}"
+    if note:
+        text += f"\n{_html_escape(note)}"
+    return text
 
 async def _run_test_timer(msg: Message, chat_id: int, stop_event: asyncio.Event, duration: float):
     loop = asyncio.get_running_loop()
     end_at = loop.time() + duration
-    final_text = "Таймер завершён."
+    final_text = None
     try:
         while True:
-            if stop_event.is_set():
-                final_text = "Таймер остановлен командой /stop."
-                break
             remaining = end_at - loop.time()
+            if stop_event.is_set():
+                final_text = render_timer_frame(remaining, duration, sign="■", note="Таймер остановлен командой /stop.")
+                break
             if remaining <= 0:
-                final_text = f"{format_countdown(0)}\n\nВремя вышло. Таймер завершён."
+                final_text = render_timer_frame(0, duration, sign="■", note="Время вышло. Таймер завершён.")
                 break
             try:
-                await msg.edit_text(render_timer_frame(remaining))
+                await msg.edit_text(
+                    render_timer_frame(remaining, duration, note="Остановить: /stop"),
+                    parse_mode='HTML'
+                )
             except RetryAfter as e:
                 await asyncio.sleep(float(getattr(e, "retry_after", 1)) + 0.2)
                 continue
             except BadRequest as e:
-                if "not modified" in str(e).lower():
-                    pass
-                else:
+                if "not modified" not in str(e).lower():
                     logger.info(f"Тестовый таймер в чате {chat_id} прерван: {e}")
                     return
             except TelegramError as e:
@@ -4419,7 +4442,7 @@ async def _run_test_timer(msg: Message, chat_id: int, stop_event: asyncio.Event,
             except asyncio.TimeoutError:
                 pass
         try:
-            await msg.edit_text(final_text)
+            await msg.edit_text(final_text, parse_mode='HTML')
         except TelegramError:
             pass
     finally:
@@ -4439,7 +4462,10 @@ async def timer_test(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Тестовый таймер в этом чате уже идёт. Остановить: /stop")
         return
 
-    msg = await update.message.reply_text(render_timer_frame(TIMER_TEST_DURATION_SECONDS))
+    msg = await update.message.reply_text(
+        render_timer_frame(TIMER_TEST_DURATION_SECONDS, note="Остановить: /stop"),
+        parse_mode='HTML'
+    )
     stop_event = asyncio.Event()
     task = asyncio.create_task(_run_test_timer(msg, chat_id, stop_event, TIMER_TEST_DURATION_SECONDS))
     active_test_timers[chat_id] = {"stop": stop_event, "task": task}
