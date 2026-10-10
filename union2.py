@@ -6,6 +6,7 @@ import uuid
 import asyncio
 import random
 import re
+import math
 import functools
 import aiohttp
 from typing import Optional
@@ -32,7 +33,7 @@ from telegram.ext import (
     filters,
     ContextTypes,
 )
-from telegram.error import TelegramError
+from telegram.error import TelegramError, RetryAfter, BadRequest
 user_animation_lock = {}
 
 # ==================== ПРОГРЕССИВНЫЙ АНТИСПАМ (БАНЫ) ====================
@@ -2625,6 +2626,8 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 /addanketnik — назначить анкетника
 /resetcd — обнулить кулдаун на отправку анкеты у участника (доступно и модераторам)
 /forcefacts — принудительно запустить извлечение фактов ИИ
+/timertest — тестовый таймер-отсчёт (доступно и модераторам)
+/stop — остановить тестовый таймер
 """
 
     help_text += "\nЕсли и этого недостаточно — обратись к администрации, я не справочная служба.\n"
@@ -4357,6 +4360,104 @@ async def stopzoom(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except TelegramError as e:
         logger.warning(f"Не удалось отправить уведомление пользователю {target_id} о завершении Зума: {e}")
 
+# ==================== ТЕСТОВЫЙ ТАЙМЕР (для админов) ====================
+TIMER_TEST_DURATION_SECONDS = 120   # таймер сам завершается через 2 минуты
+TIMER_TICK_SECONDS = 1.0            # как часто обновляется сообщение
+TIMER_SCRAMBLE_CHARS = "#$%&@!?01_-/\\<>[]{}=+*^~▓▒░█▀▄"
+TIMER_SIDE_LEN = 9                  # сколько «мусорных» символов с каждой стороны
+
+# chat_id -> {"stop": asyncio.Event, "task": asyncio.Task}
+active_test_timers: dict[int, dict] = {}
+
+def _scramble(length: int = TIMER_SIDE_LEN) -> str:
+    return ''.join(random.choice(TIMER_SCRAMBLE_CHARS) for _ in range(length))
+
+def format_countdown(total_seconds: int) -> str:
+    total_seconds = max(0, int(total_seconds))
+    days, rest = divmod(total_seconds, 86400)
+    hours, rest = divmod(rest, 3600)
+    minutes, seconds = divmod(rest, 60)
+    return f"{days:02d} дн : {hours:02d} ч : {minutes:02d} мин : {seconds:02d} сек"
+
+def render_timer_frame(remaining_seconds: float) -> str:
+    countdown = format_countdown(math.ceil(remaining_seconds))
+    return (
+        "ТЕСТОВЫЙ ТАЙМЕР\n\n"
+        f"{_scramble()}  {countdown}  {_scramble()}\n\n"
+        "До конца теста. Остановить: /stop"
+    )
+
+async def _run_test_timer(msg: Message, chat_id: int, stop_event: asyncio.Event, duration: float):
+    loop = asyncio.get_running_loop()
+    end_at = loop.time() + duration
+    final_text = "Таймер завершён."
+    try:
+        while True:
+            if stop_event.is_set():
+                final_text = "Таймер остановлен командой /stop."
+                break
+            remaining = end_at - loop.time()
+            if remaining <= 0:
+                final_text = f"{format_countdown(0)}\n\nВремя вышло. Таймер завершён."
+                break
+            try:
+                await msg.edit_text(render_timer_frame(remaining))
+            except RetryAfter as e:
+                await asyncio.sleep(float(getattr(e, "retry_after", 1)) + 0.2)
+                continue
+            except BadRequest as e:
+                if "not modified" in str(e).lower():
+                    pass
+                else:
+                    logger.info(f"Тестовый таймер в чате {chat_id} прерван: {e}")
+                    return
+            except TelegramError as e:
+                logger.warning(f"Тестовый таймер в чате {chat_id}: ошибка редактирования: {e}")
+                return
+            try:
+                await asyncio.wait_for(stop_event.wait(), timeout=TIMER_TICK_SECONDS)
+            except asyncio.TimeoutError:
+                pass
+        try:
+            await msg.edit_text(final_text)
+        except TelegramError:
+            pass
+    finally:
+        active_test_timers.pop(chat_id, None)
+
+@rate_limit()
+async def timer_test(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if not user or not update.message:
+        return
+    if not is_admin(user.id):
+        await update.message.reply_text("Эта команда только для администрации.")
+        return
+
+    chat_id = update.effective_chat.id
+    if chat_id in active_test_timers:
+        await update.message.reply_text("Тестовый таймер в этом чате уже идёт. Остановить: /stop")
+        return
+
+    msg = await update.message.reply_text(render_timer_frame(TIMER_TEST_DURATION_SECONDS))
+    stop_event = asyncio.Event()
+    task = asyncio.create_task(_run_test_timer(msg, chat_id, stop_event, TIMER_TEST_DURATION_SECONDS))
+    active_test_timers[chat_id] = {"stop": stop_event, "task": task}
+
+async def timer_stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if not user or not update.message:
+        return
+    if not is_admin(user.id):
+        await update.message.reply_text("Такой команды не существует. Загляни в /help, если совсем потерялся.")
+        return
+
+    entry = active_test_timers.get(update.effective_chat.id)
+    if not entry:
+        await update.message.reply_text("Сейчас нет запущенного тестового таймера.")
+        return
+    entry["stop"].set()
+
 # ==================== ПУБЛИЧНЫЕ ЧАТЫ (бот вне ALLOWED_CHAT_IDS) ====================
 PUBLIC_CHAT_LOG_MAXLEN = 20
 REPLY_CHAIN_LIMIT = 5
@@ -4753,6 +4854,8 @@ async def set_commands(application: Application):
         BotCommand("addanketnik", "Назначить анкетника"),
         BotCommand("resetcd", "Обнулить кулдаун на отправку анкеты у участника"),
         BotCommand("forcefacts", "Принудительно запустить извлечение фактов ИИ"),
+        BotCommand("timertest", "Тест: таймер-отсчёт (до /stop или 2 минут)"),
+        BotCommand("stop", "Остановить тестовый таймер"),
         BotCommand("forcetrust", "Тест: выставить уровень доверия (0-5)"),
         BotCommand("resettrust", "Тест: сбросить уровень доверия в 0"),
     ]
@@ -4868,6 +4971,8 @@ def main():
     application.add_handler(CommandHandler("addanketnik", add_anketnik))
     application.add_handler(CommandHandler("resetcd", reset_anketa_cd))
     application.add_handler(CommandHandler("forcefacts", force_extract_facts))
+    application.add_handler(CommandHandler("timertest", timer_test))
+    application.add_handler(CommandHandler(["stop", "timerstop"], timer_stop))
     application.add_handler(CommandHandler("forcetrust", force_trust))
     application.add_handler(CommandHandler("resettrust", reset_trust))
     # RP-команды
