@@ -11,15 +11,6 @@ import functools
 import aiohttp
 from typing import Optional
 from collections import deque, OrderedDict
-import os, sys
-print("=== DEBUG ===")
-print("CWD:", os.getcwd())
-print("Script dir:", os.path.dirname(os.path.abspath(__file__)))
-print("Files here:", os.listdir(os.path.dirname(os.path.abspath(__file__))))
-print("sys.path:", sys.path)
-print("=============")
-
-import chess_game
 
 from dotenv import load_dotenv
 load_dotenv()
@@ -45,6 +36,8 @@ from telegram.ext import (
 from telegram.error import TelegramError, RetryAfter, BadRequest
 import chess  # pip install chess
 import chess_game  # шахматный модуль (chess_game.py лежит рядом с ботом)
+import durak_game  # карточный «Дурак» (durak_game.py лежит рядом с ботом)
+import durak_group  # «Дурак» для группы на 2-4 игрока (durak_group.py лежит рядом с ботом)
 user_animation_lock = {}
 
 # ==================== ПРОГРЕССИВНЫЙ АНТИСПАМ (БАНЫ) ====================
@@ -79,7 +72,7 @@ ANKETA_RULES_NOTICE = (
 MAX_PENDING_ANKETAS_PER_USER = 2  # сколько анкет одновременно может висеть на рассмотрении у одного участника
 # Порог длины анкеты, после которого обязательна ссылка на Telegraph — больше одного сообщения Telegram (4096),
 # но меньше двух (8192).
-ANKETA_MAX_CHARS_WITHOUT_LINK = 6145
+ANKETA_MAX_CHARS_WITHOUT_LINK = 6144
 
 ALLOWED_CHAT_IDS = [
     int(x) for x in os.getenv('ALLOWED_CHAT_IDS', '-1003431402721,-1003355542910,-1003300824366,-1003394079022,-1003062290367').split(',')
@@ -2633,11 +2626,20 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 <b>Шахматы:</b>
 /chess — сыграть партию с Амадеусом (<code>/chess black</code> — играть чёрными)
 /chess_stop — сдаться и закончить партию
+/chess_legend — обозначения фигур на доске (какая буква что значит)
 
 <b>Шахматы в группе (игрок против игрока):</b>
 /chess_pvp — вызвать на партию (ответом на сообщение, <code>/chess_pvp @ник</code> или открытый вызов)
 /move — сделать ход командой, например <code>/move e4</code> (можно и просто написать ход сообщением)
 /chess_draw — предложить ничью или согласиться на неё
+
+<b>Крестики-нолики:</b>
+/xo — сыграть (в личке — с Амадеусом, в группе — с другим участником)
+
+<b>Карточные игры:</b>
+/durak — подкидной дурак с Амадеусом (только в личке)
+/durak_stop — сдаться и закончить партию (в группе — остановить партию или лобби)
+/durak_group — дурак на 2–4 игрока в группе (карты приходят в личку, нужен /start боту)
 /chess_stop — в группе: сдаться (админы — остановить партию)
 """
 
@@ -4400,7 +4402,8 @@ CHESS_INPUT_RULES = (
     "• Превращение пешки: <code>e8=Q</code> (в записи <code>e7e8</code> пешка станет ферзём).\n"
     "• Если ход подходит двум фигурам, уточни: <code>Nbd2</code> или <code>R1e2</code>. "
     "Можно и просто координатами: <code>e2e4</code>.\n"
-    "• Знаки <code>+</code>, <code>#</code>, <code>!</code> писать не нужно."
+    "• Знаки <code>+</code>, <code>#</code>, <code>!</code> писать не нужно.\n"
+    "• Что означают буквы на доске — /chess_legend."
 )
 CHESS_HOWTO = (
     CHESS_INPUT_RULES + "\n\n"
@@ -4429,7 +4432,7 @@ def _render_chess_message(game, comment: str, bot_san: Optional[str] = None, foo
     if bot_san:
         parts.append(f"Мой ход: <b>{_html_escape(bot_san)}</b>")
     board_txt = chess_game.render_board(game.board, game.user_color)
-    parts.append(f"<pre>{_html_escape(board_txt)}</pre>")
+    parts.append(f"<pre>{_html_escape(board_txt)}</pre>\n{_html_escape(chess_game.CHESS_LEGEND_SHORT)}")
     if footer:
         parts.append(_html_escape(footer))
     return "\n\n".join(parts)
@@ -4659,6 +4662,14 @@ async def handle_chess_message(update: Update, context: ContextTypes.DEFAULT_TYP
         game.busy = False
 
 
+@rate_limit()
+async def chess_legend_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/chess_legend — обозначения фигур на доске. Работает и в личке, и в группе."""
+    if not update.message:
+        return
+    await update.message.reply_text(chess_game.CHESS_LEGEND_HTML, parse_mode='HTML')
+
+
 # ==================== ШАХМАТЫ В ГРУППЕ: ИГРОК ПРОТИВ ИГРОКА ====================
 # Нейронка здесь не участвует вообще. Одна активная партия на чат; состояние в памяти бота.
 pvp_games: dict[int, "chess_game.PvpGame"] = {}      # chat_id -> партия
@@ -4678,7 +4689,10 @@ def _mention(user_id: int, name: str) -> str:
 
 
 def _pvp_board_html(game) -> str:
-    return f"<pre>{_html_escape(chess_game.render_board(game.board, chess.WHITE))}</pre>"
+    return (
+        f"<pre>{_html_escape(chess_game.render_board(game.board, chess.WHITE))}</pre>\n"
+        f"{_html_escape(chess_game.CHESS_LEGEND_SHORT)}"
+    )
 
 
 def _pvp_result_line(game, result) -> str:
@@ -4969,6 +4983,699 @@ async def chess_draw_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await msg.reply_text(
             f"Ничья по соглашению игроков.\n\n{_pvp_board_html(game)}", parse_mode='HTML'
         )
+
+
+# ==================== ДУРАК (подкидной, против Амадеуса) ====================
+# Правила и «ум» бота — в durak_game.py. Здесь — только кнопки и обработка нажатий.
+# Партия одна на пользователя, хранится в памяти бота и играется только в личке.
+durak_games: dict[int, "durak_game.DurakGame"] = {}
+
+
+def _durak_get(user_id: int):
+    game = durak_games.get(user_id)
+    if game and game.is_expired():
+        durak_games.pop(user_id, None)
+        return None
+    return game
+
+
+def _durak_keyboard(game) -> Optional[InlineKeyboardMarkup]:
+    cards, targets, extras = game.available_actions()
+
+    def btn(label, action):
+        return InlineKeyboardButton(label, callback_data=f"dur_{game.gid}_{action}")
+
+    rows = []
+    for i in range(0, len(cards), 4):
+        rows.append([btn(*c) for c in cards[i:i + 4]])
+    if targets:
+        rows.append([btn(*t) for t in targets])
+    if extras:
+        rows.append([btn(*e) for e in extras])
+    return InlineKeyboardMarkup(rows) if rows else None
+
+
+@rate_limit()
+async def durak_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/durak — подкидной дурак против Амадеуса (только в личке)."""
+    msg = update.message
+    user = update.effective_user
+    if not msg or not user:
+        return
+    if update.effective_chat.type != 'private':
+        await msg.reply_text(
+            "В дурака со мной играют только в личных сообщениях — напиши мне туда: /durak.\n"
+            "А чтобы сыграть в группе с другими участниками (2-4 игрока) — /durak_group."
+        )
+        return
+
+    session = SessionLocal()
+    try:
+        db_user, _ = get_or_create_user(session, user.id, user.username)
+        if db_user.is_banned:
+            await msg.reply_text("Тебе сюда нельзя. Ты забанен.")
+            return
+    finally:
+        session.close()
+
+    game = _durak_get(user.id)
+    if game:
+        await msg.reply_text("Партия уже идёт — вот её текущее состояние. Сдаться: /durak_stop.")
+    else:
+        game = durak_game.DurakGame(uuid.uuid4().hex[:8])
+        durak_games[user.id] = game
+        if game.phase == "over":  # на всякий случай: партия не должна заканчиваться на раздаче
+            durak_games.pop(user.id, None)
+    await msg.reply_text(game.render_text(), parse_mode='HTML', reply_markup=_durak_keyboard(game))
+
+
+@rate_limit()
+async def durak_stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if not user or not update.message:
+        return
+    if update.effective_chat.type in ('group', 'supergroup'):
+        await _dgroup_stop(update, context)
+        return
+    if durak_games.pop(user.id, None):
+        await update.message.reply_text("Сдаёшься? Тогда дураком записываю тебя. Реванш — /durak.")
+    else:
+        await update.message.reply_text("Партии в дурака сейчас нет. Начать: /durak.")
+
+
+async def durak_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    user = query.from_user
+    parts = (query.data or "").split('_', 2)
+    if len(parts) != 3:
+        await query.answer()
+        return
+    gid, action = parts[1], parts[2]
+
+    game = _durak_get(user.id)
+    if not game or game.gid != gid:
+        await query.answer("Эта партия уже закончена или устарела. Новая: /durak", show_alert=True)
+        try:
+            await query.edit_message_reply_markup(reply_markup=None)
+        except TelegramError:
+            pass
+        return
+
+    try:
+        if action == "take":
+            game.user_take()
+        elif action == "bito":
+            game.user_bito()
+        elif action == "done":
+            game.user_done_adding()
+        elif action.startswith("c"):
+            card = durak_game.parse_card_code(action[1:])
+            if game.phase == "defend":
+                game.user_defend(card)
+            else:
+                game.user_attack(card)
+        elif action.startswith("g") and action[1:].isdigit():
+            game.set_target(int(action[1:]))
+        else:
+            await query.answer()
+            return
+    except durak_game.DurakError as e:
+        await query.answer(str(e), show_alert=True)
+        return
+    except Exception as e:
+        logger.error(f"Ошибка в партии дурака у {user.id}: {e}", exc_info=True)
+        durak_games.pop(user.id, None)
+        await query.answer("Что-то сломалось в партии. Начни заново: /durak", show_alert=True)
+        return
+
+    await query.answer()
+    text, markup = game.render_text(), _durak_keyboard(game)
+    if game.phase == "over":
+        durak_games.pop(user.id, None)
+    try:
+        await query.edit_message_text(text, parse_mode='HTML', reply_markup=markup)
+    except BadRequest as e:
+        if "not modified" not in str(e).lower():
+            logger.warning(f"Дурак: не удалось обновить сообщение: {e}")
+    except TelegramError as e:
+        logger.warning(f"Дурак: не удалось обновить сообщение: {e}")
+
+
+# ==================== ДУРАК В ГРУППЕ (2-4 игрока) ====================
+# Правила — в durak_group.py. Карты у каждого свои, поэтому рука и кнопки хода приходят игроку
+# в личку (он должен хоть раз написать боту /start), а в группе лежит только общее состояние стола.
+# Одна партия на чат и один игрок — в одной партии. Состояние хранится в памяти бота.
+dgroup_games: dict[str, "durak_group.DurakTable"] = {}
+dgroup_by_chat: dict[int, str] = {}
+dgroup_by_user: dict[int, str] = {}
+dgroup_locks: dict[str, asyncio.Lock] = {}
+
+
+def _dgroup_drop(game):
+    dgroup_games.pop(game.gid, None)
+    if dgroup_by_chat.get(game.chat_id) == game.gid:
+        dgroup_by_chat.pop(game.chat_id, None)
+    for uid in list(game.players):
+        if dgroup_by_user.get(uid) == game.gid:
+            dgroup_by_user.pop(uid, None)
+    dgroup_locks.pop(game.gid, None)
+
+
+def _dgroup_in_chat(chat_id: int):
+    gid = dgroup_by_chat.get(chat_id)
+    game = dgroup_games.get(gid) if gid else None
+    if game and game.is_expired():
+        _dgroup_drop(game)
+        game = None
+    if not game:
+        dgroup_by_chat.pop(chat_id, None)
+    return game
+
+
+def _dgroup_of_user(user_id: int):
+    gid = dgroup_by_user.get(user_id)
+    game = dgroup_games.get(gid) if gid else None
+    if game and game.is_expired():
+        _dgroup_drop(game)
+        game = None
+    if not game:
+        dgroup_by_user.pop(user_id, None)
+    return game
+
+
+def _dgroup_public_keyboard(game) -> Optional[InlineKeyboardMarkup]:
+    gid = game.gid
+    if game.state == "lobby":
+        return InlineKeyboardMarkup([
+            [InlineKeyboardButton("Войти", callback_data=f"dgrp_{gid}_join"),
+             InlineKeyboardButton("Выйти", callback_data=f"dgrp_{gid}_leave")],
+            [InlineKeyboardButton("▶️ Начать", callback_data=f"dgrp_{gid}_start"),
+             InlineKeyboardButton("✖️ Отмена", callback_data=f"dgrp_{gid}_cancel")],
+        ])
+    if game.state == "play":
+        return InlineKeyboardMarkup([[InlineKeyboardButton("🃏 Мои карты", callback_data=f"dgrp_{gid}_hand")]])
+    return None
+
+
+def _dgroup_dm_keyboard(game, uid: int) -> Optional[InlineKeyboardMarkup]:
+    cards, targets, extras = game.available_actions(uid)
+
+    def btn(label, action):
+        return InlineKeyboardButton(label, callback_data=f"dgrp_{game.gid}_{action}")
+
+    rows = []
+    for i in range(0, len(cards), 4):
+        rows.append([btn(*c) for c in cards[i:i + 4]])
+    if targets:
+        rows.append([btn(*t) for t in targets])
+    if extras:
+        rows.append([btn(*e) for e in extras])
+    return InlineKeyboardMarkup(rows) if rows else None
+
+
+async def _dgroup_send_dm(bot, game, uid: int, text: str, markup) -> bool:
+    try:
+        sent = await bot.send_message(chat_id=uid, text=text, parse_mode='HTML', reply_markup=markup)
+        game.dm_ids[uid] = sent.message_id
+        return True
+    except TelegramError as e:
+        logger.info(f"Дурак: не удалось написать игроку {uid} в личку: {e}")
+        return False
+
+
+async def _dgroup_update_dm(bot, game, uid: int):
+    text = game.render_private(uid)
+    markup = _dgroup_dm_keyboard(game, uid)
+    mid = game.dm_ids.get(uid)
+    if mid:
+        try:
+            await bot.edit_message_text(chat_id=uid, message_id=mid, text=text, parse_mode='HTML', reply_markup=markup)
+            return
+        except BadRequest as e:
+            if "not modified" in str(e).lower():
+                return
+        except TelegramError:
+            pass
+    await _dgroup_send_dm(bot, game, uid, text, markup)
+
+
+async def _dgroup_update_public(bot, game):
+    try:
+        await bot.edit_message_text(
+            chat_id=game.chat_id, message_id=game.message_id, text=game.render_public(),
+            parse_mode='HTML', reply_markup=_dgroup_public_keyboard(game)
+        )
+    except BadRequest as e:
+        if "not modified" not in str(e).lower():
+            logger.warning(f"Дурак (группа): не удалось обновить сообщение: {e}")
+    except TelegramError as e:
+        logger.warning(f"Дурак (группа): не удалось обновить сообщение: {e}")
+
+
+async def _dgroup_refresh(bot, game):
+    """Обновляет общее сообщение в группе и личные сообщения всех игроков."""
+    await _dgroup_update_public(bot, game)
+    for uid in game.players:
+        await _dgroup_update_dm(bot, game, uid)
+    if game.state == "over":
+        _dgroup_drop(game)
+
+
+@rate_limit()
+async def durak_group_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/durak_group — набрать 2-4 игроков на партию в подкидного дурака в этом чате."""
+    msg = update.message
+    user = update.effective_user
+    if not msg or not user:
+        return
+    if update.effective_chat.type not in ('group', 'supergroup'):
+        await msg.reply_text("Эта команда — для групп. Один на один со мной — /durak в личных сообщениях.")
+        return
+
+    session = SessionLocal()
+    try:
+        db_user, _ = get_or_create_user(session, user.id, user.username)
+        if db_user.is_banned:
+            await msg.reply_text("Тебе сюда нельзя. Ты забанен.")
+            return
+    finally:
+        session.close()
+
+    chat_id = update.effective_chat.id
+    if _dgroup_in_chat(chat_id):
+        await msg.reply_text("В этом чате уже идёт лобби или партия в дурака. Остановить: /durak_stop.")
+        return
+    if _dgroup_of_user(user.id):
+        await msg.reply_text("Ты уже участвуешь в другой партии в дурака. Сначала закончи её или останови: /durak_stop.")
+        return
+
+    game = durak_group.DurakTable(uuid.uuid4().hex[:8], chat_id, user.id, user.full_name)
+    ok = await _dgroup_send_dm(
+        context.bot, game, user.id,
+        "Ты организатор партии в дурака. Когда партия начнётся, сюда придут твои карты и кнопки хода.", None
+    )
+    if not ok:
+        await msg.reply_text(
+            "Карты приходят в личные сообщения, а я не могу написать тебе первой. "
+            "Отправь мне в личку /start и повтори /durak_group."
+        )
+        return
+
+    sent = await msg.reply_text(game.render_lobby(), parse_mode='HTML', reply_markup=_dgroup_public_keyboard(game))
+    game.message_id = sent.message_id
+    dgroup_games[game.gid] = game
+    dgroup_by_chat[chat_id] = game.gid
+    dgroup_by_user[user.id] = game.gid
+
+
+async def _dgroup_stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.message
+    user = update.effective_user
+    game = _dgroup_in_chat(update.effective_chat.id)
+    if not game:
+        await msg.reply_text("В этом чате нет ни лобби, ни партии в дурака.")
+        return
+    if user.id not in game.players and not is_admin(user.id):
+        await msg.reply_text("Остановить партию могут только её игроки и администраторы.")
+        return
+    lock = dgroup_locks.setdefault(game.gid, asyncio.Lock())
+    async with lock:
+        if dgroup_games.get(game.gid) is not game:
+            return
+        game.state = "over"
+        game.phase = "over"
+        game.stopped_by = f"остановил(а) {user.full_name}"
+        await _dgroup_update_public(context.bot, game)
+        if game.trump is not None:
+            for uid in game.players:
+                await _dgroup_update_dm(context.bot, game, uid)
+        _dgroup_drop(game)
+    await msg.reply_text("Партия в дурака остановлена.")
+
+
+async def dgroup_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    parts = (query.data or "").split('_', 2)
+    if len(parts) != 3:
+        await query.answer()
+        return
+    gid, action = parts[1], parts[2]
+
+    game = dgroup_games.get(gid)
+    if game and game.is_expired():
+        _dgroup_drop(game)
+        game = None
+    if not game:
+        await query.answer("Эта партия уже закончена или устарела. Новая: /durak_group", show_alert=True)
+        try:
+            await query.edit_message_reply_markup(reply_markup=None)
+        except TelegramError:
+            pass
+        return
+
+    lock = dgroup_locks.setdefault(gid, asyncio.Lock())
+    async with lock:
+        if dgroup_games.get(gid) is not game:
+            await query.answer("Партия уже закончена.", show_alert=True)
+            return
+        if game.state == "lobby":
+            await _dgroup_lobby_action(update, context, game, action)
+        elif game.state == "play":
+            await _dgroup_play_action(update, context, game, action)
+        else:
+            await query.answer("Партия уже закончена.")
+
+
+async def _dgroup_lobby_action(update: Update, context: ContextTypes.DEFAULT_TYPE, game, action: str):
+    query = update.callback_query
+    user = query.from_user
+    bot = context.bot
+    try:
+        if action == "join":
+            if user.is_bot:
+                await query.answer()
+                return
+            other = _dgroup_of_user(user.id)
+            if other and other.gid != game.gid:
+                raise durak_group.DurakError("Ты уже участвуешь в другой партии в дурака.")
+            if user.id in game.players:
+                raise durak_group.DurakError("Ты уже в списке игроков.")
+            if len(game.players) >= durak_group.MAX_PLAYERS:
+                raise durak_group.DurakError(f"Мест нет — максимум {durak_group.MAX_PLAYERS} игрока.")
+            ok = await _dgroup_send_dm(
+                bot, game, user.id,
+                "Ты в лобби дурака. Когда организатор начнёт партию, сюда придут твои карты и кнопки хода.", None
+            )
+            if not ok:
+                raise durak_group.DurakError(
+                    "Не могу написать тебе в личку. Отправь боту /start в личных сообщениях "
+                    "и нажми «Войти» ещё раз."
+                )
+            game.add_player(user.id, user.full_name)
+            dgroup_by_user[user.id] = game.gid
+            await query.answer("Ты в игре!")
+        elif action == "leave":
+            game.remove_player(user.id)
+            dgroup_by_user.pop(user.id, None)
+            await query.answer("Ты вышел из лобби.")
+        elif action == "start":
+            if user.id != game.host_id:
+                raise durak_group.DurakError("Начать партию может только организатор.")
+            game.start()
+            failed = []
+            for uid in game.players:
+                if not await _dgroup_send_dm(bot, game, uid, game.render_private(uid), _dgroup_dm_keyboard(game, uid)):
+                    failed.append(game.name(uid))
+            if failed:
+                game.state = "over"
+                game.phase = "over"
+                game.stopped_by = "не удалось написать в личку: " + ", ".join(failed)
+                await _dgroup_update_public(bot, game)
+                _dgroup_drop(game)
+                await query.answer()
+                return
+            await query.answer("Партия началась! Карты — у тебя в личке.")
+        elif action == "cancel":
+            if user.id != game.host_id and not is_admin(user.id):
+                raise durak_group.DurakError("Отменить лобби может организатор или администратор.")
+            game.state = "over"
+            game.phase = "over"
+            game.stopped_by = f"отменил(а) {user.full_name}"
+            await _dgroup_update_public(bot, game)
+            _dgroup_drop(game)
+            await query.answer()
+            return
+        else:
+            await query.answer()
+            return
+    except durak_group.DurakError as e:
+        await query.answer(str(e), show_alert=True)
+        return
+    await _dgroup_update_public(bot, game)
+
+
+async def _dgroup_play_action(update: Update, context: ContextTypes.DEFAULT_TYPE, game, action: str):
+    query = update.callback_query
+    uid = query.from_user.id
+    if action == "hand":
+        await query.answer(game.hand_text(uid), show_alert=True)
+        return
+    if uid not in game.players:
+        await query.answer("Ты не участвуешь в этой партии.", show_alert=True)
+        return
+    try:
+        if action == "take":
+            game.take(uid)
+        elif action == "pass":
+            game.pass_(uid)
+        elif action.startswith("c"):
+            card = durak_group.parse_card_code(action[1:])
+            if game.phase == "defend" and uid == game.defender:
+                game.defend(uid, card)
+            else:
+                game.attack(uid, card)
+        elif action.startswith("g") and action[1:].isdigit():
+            game.set_target(uid, int(action[1:]))
+        else:
+            await query.answer()
+            return
+    except durak_group.DurakError as e:
+        await query.answer(str(e), show_alert=True)
+        return
+    except Exception as e:
+        logger.error(f"Ошибка в партии дурака (группа) {game.gid}: {e}", exc_info=True)
+        game.state = "over"
+        game.phase = "over"
+        game.stopped_by = "в партии произошла ошибка"
+        await query.answer("Что-то сломалось, партия остановлена. Новая: /durak_group", show_alert=True)
+        await _dgroup_refresh(context.bot, game)
+        return
+    await query.answer()
+    await _dgroup_refresh(context.bot, game)
+
+
+async def cleanup_dgroup_loop():
+    while True:
+        await asyncio.sleep(300)
+        try:
+            for game in list(dgroup_games.values()):
+                if game.is_expired():
+                    _dgroup_drop(game)
+        except Exception as e:
+            logger.error(f"Ошибка очистки партий дурака в группах: {e}")
+
+
+# ==================== КРЕСТИКИ-НОЛИКИ ====================
+# Играется на инлайн-кнопках 3x3. В личке — против Амадеуса, в группе — игрок против игрока
+# (создатель — ❌, ❌ ходит первым; ⭕ становится первый другой участник, нажавший на клетку).
+XO_LINES = [(0, 1, 2), (3, 4, 5), (6, 7, 8), (0, 3, 6), (1, 4, 7), (2, 5, 8), (0, 4, 8), (2, 4, 6)]
+XO_CELL = {None: "⬜", "X": "❌", "O": "⭕"}
+XO_BOT_MISTAKE_CHANCE = 0.25      # шанс, что Амадеус сделает случайный ход вместо лучшего — чтобы её можно было обыграть
+XO_TTL_MINUTES = 120              # брошенная партия стирается через столько минут
+
+XO_BOT_WIN_LINES = [
+    "Я выиграла. Предсказуемо.",
+    "Мат в крестики-нолики — это, пожалуй, самое скромное из моих достижений.",
+    "Победа за мной. Не расстраивайся, логика — дело наживное.",
+]
+XO_BOT_LOSE_LINES = [
+    "Ты выиграл... Ладно, признаю. Но не зазнавайся.",
+    "Хм. Я поддавалась. Ну, почти.",
+    "Победа твоя. Статистическая погрешность, не более.",
+]
+XO_DRAW_LINES = [
+    "Ничья. Оба сыграли ожидаемо.",
+    "Ничья. Ничего удивительного — это крестики-нолики.",
+]
+
+xo_games: dict[str, dict] = {}
+
+
+def _xo_winner(board: list):
+    for a, b, c in XO_LINES:
+        if board[a] and board[a] == board[b] == board[c]:
+            return board[a]
+    return None
+
+
+def _xo_minimax(board: list, player: str, me: str) -> int:
+    win = _xo_winner(board)
+    if win:
+        return 1 if win == me else -1
+    if all(board):
+        return 0
+    other = "O" if player == "X" else "X"
+    scores = []
+    for i in range(9):
+        if board[i] is None:
+            board[i] = player
+            scores.append(_xo_minimax(board, other, me))
+            board[i] = None
+    return max(scores) if player == me else min(scores)
+
+
+def _xo_bot_move(board: list, bot: str = "O") -> int:
+    free = [i for i in range(9) if board[i] is None]
+    if random.random() < XO_BOT_MISTAKE_CHANCE:
+        return random.choice(free)
+    human = "X" if bot == "O" else "O"
+    best_score, best_moves = None, []
+    for i in free:
+        board[i] = bot
+        score = _xo_minimax(board, human, bot)
+        board[i] = None
+        if best_score is None or score > best_score:
+            best_score, best_moves = score, [i]
+        elif score == best_score:
+            best_moves.append(i)
+    return random.choice(best_moves)
+
+
+def _xo_player_label(player) -> str:
+    if player is None:
+        return "ждём соперника"
+    pid, name = player
+    return "Амадеус" if pid == 0 else _mention(pid, name)
+
+
+def _xo_keyboard(gid: str, game: dict) -> InlineKeyboardMarkup:
+    rows = []
+    for r in range(3):
+        rows.append([
+            InlineKeyboardButton(XO_CELL[game["board"][r * 3 + c]], callback_data=f"xo_{gid}_{r * 3 + c}")
+            for c in range(3)
+        ])
+    return InlineKeyboardMarkup(rows)
+
+
+def _xo_text(game: dict) -> str:
+    x_label = _xo_player_label(game["players"]["X"])
+    o_label = _xo_player_label(game["players"]["O"])
+    text = f"<b>Крестики-нолики</b>\n❌ {x_label}  против  ⭕ {o_label}\n\n"
+    if game["winner"]:
+        text += f"Победил(а) {_xo_player_label(game['players'][game['winner']])} ({XO_CELL[game['winner']]})."
+    elif game["over"]:
+        text += "Ничья."
+    else:
+        turn = game["turn"]
+        text += f"Ходит {XO_CELL[turn]} {_xo_player_label(game['players'][turn])}."
+    if game.get("comment"):
+        text += f"\n\n{_html_escape(game['comment'])}"
+    return text
+
+
+def _purge_old_xo_games():
+    now = datetime.datetime.now(datetime.UTC)
+    limit = datetime.timedelta(minutes=XO_TTL_MINUTES)
+    for gid in [g for g, gm in xo_games.items() if now - gm["created"] > limit]:
+        xo_games.pop(gid, None)
+
+
+@rate_limit()
+async def xo_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/xo — крестики-нолики. В личке — с Амадеусом, в группе — с другим участником."""
+    msg = update.message
+    user = update.effective_user
+    if not msg or not user:
+        return
+
+    _purge_old_xo_games()
+    is_private = update.effective_chat.type == 'private'
+    game = {
+        "mode": "bot" if is_private else "pvp",
+        "board": [None] * 9,
+        "turn": "X",
+        "players": {"X": (user.id, user.full_name), "O": (0, "Амадеус") if is_private else None},
+        "over": False,
+        "winner": None,
+        "comment": "" if is_private else "Соперником станет первый, кто нажмёт на клетку после хода ❌.",
+        "created": datetime.datetime.now(datetime.UTC),
+    }
+    gid = uuid.uuid4().hex[:8]
+    xo_games[gid] = game
+    await msg.reply_text(_xo_text(game), parse_mode='HTML', reply_markup=_xo_keyboard(gid, game))
+
+
+async def xo_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    user = query.from_user
+    parts = (query.data or "").split('_')
+    if len(parts) != 3 or not parts[2].isdigit():
+        await query.answer()
+        return
+    gid, idx = parts[1], int(parts[2])
+    game = xo_games.get(gid)
+    if not game:
+        await query.answer("Эта партия устарела. Начни новую: /xo", show_alert=True)
+        try:
+            await query.edit_message_reply_markup(reply_markup=None)
+        except TelegramError:
+            pass
+        return
+    if game["over"]:
+        await query.answer("Партия уже окончена.")
+        return
+    if idx > 8 or game["board"][idx] is not None:
+        await query.answer("Клетка занята.")
+        return
+
+    turn = game["turn"]
+    players = game["players"]
+
+    if game["mode"] == "bot":
+        if user.id != players["X"][0]:
+            await query.answer("Это не твоя партия. Начни свою: /xo", show_alert=True)
+            return
+    else:
+        current = players[turn]
+        if current is None:  # ходит ⭕, но соперник ещё не определился
+            if user.id == players["X"][0]:
+                await query.answer("Ждём соперника — ходит ⭕.", show_alert=True)
+                return
+            if user.is_bot:
+                await query.answer()
+                return
+            players["O"] = (user.id, user.full_name)
+        elif current[0] != user.id:
+            if user.id in (players["X"][0], (players["O"] or (None,))[0]):
+                await query.answer("Сейчас не твой ход.", show_alert=True)
+            else:
+                await query.answer("Ты не участвуешь в этой партии. Начни свою: /xo", show_alert=True)
+            return
+
+    game["board"][idx] = turn
+    game["comment"] = ""
+    game["turn"] = "O" if turn == "X" else "X"
+
+    # В партии с ботом Амадеус отвечает сразу.
+    if game["mode"] == "bot" and not _xo_winner(game["board"]) and not all(game["board"]):
+        game["board"][_xo_bot_move(game["board"], "O")] = "O"
+        game["turn"] = "X"
+
+    winner = _xo_winner(game["board"])
+    if winner or all(game["board"]):
+        game["over"] = True
+        game["winner"] = winner
+        if game["mode"] == "bot":
+            if winner == "O":
+                game["comment"] = random.choice(XO_BOT_WIN_LINES)
+            elif winner == "X":
+                game["comment"] = random.choice(XO_BOT_LOSE_LINES)
+            else:
+                game["comment"] = random.choice(XO_DRAW_LINES)
+        xo_games.pop(gid, None)
+
+    await query.answer()
+    try:
+        await query.edit_message_text(
+            _xo_text(game), parse_mode='HTML',
+            reply_markup=_xo_keyboard(gid, game)
+        )
+    except BadRequest as e:
+        if "not modified" not in str(e).lower():
+            logger.warning(f"Крестики-нолики: не удалось обновить сообщение: {e}")
+    except TelegramError as e:
+        logger.warning(f"Крестики-нолики: не удалось обновить сообщение: {e}")
 
 
 # ==================== ТЕСТОВЫЙ ТАЙМЕР (для админов) ====================
@@ -5415,6 +6122,7 @@ def cleanup_inactive_memory():
             user_animation_lock.pop(uid, None)
             user_last_command.pop(uid, None)
             chess_games.pop(uid, None)
+            durak_games.pop(uid, None)
 
             for chat_id, users_set in expected_newcomers.items():
                 users_set.discard(uid)
@@ -5518,9 +6226,14 @@ async def set_commands(application: Application):
         # Шахматы
         BotCommand("chess", "Сыграть в шахматы с Амадеусом"),
         BotCommand("chess_stop", "Сдаться / закончить шахматную партию"),
+        BotCommand("chess_legend", "Обозначения фигур на шахматной доске"),
         BotCommand("chess_pvp", "Шахматы с другим участником (в группе)"),
         BotCommand("move", "Сделать ход в партии в группе: /move e4"),
         BotCommand("chess_draw", "Предложить ничью / согласиться (в группе)"),
+        BotCommand("xo", "Крестики-нолики (в личке — с Амадеусом, в группе — с участником)"),
+        BotCommand("durak", "Сыграть в подкидного дурака с Амадеусом (в личке)"),
+        BotCommand("durak_stop", "Сдаться / закончить партию в дурака"),
+        BotCommand("durak_group", "Дурак на 2-4 игроков в группе"),
     ]
     await application.bot.set_my_commands(public_commands, scope=BotCommandScopeDefault())
 
@@ -5620,6 +6333,7 @@ async def post_init(application: Application):
     asyncio.create_task(db_health_loop(application))
     asyncio.create_task(cleanup_inactive_users_loop())
     asyncio.create_task(cleanup_anketa_disputes_loop())
+    asyncio.create_task(cleanup_dgroup_loop())
     logger.info(f"Запущена фоновая очистка неактивных пользователей (порог: {INACTIVE_DAYS_THRESHOLD} дней).")
     logger.info("Запущена фоновая очистка просроченных споров по анкетам.")
 
@@ -5659,9 +6373,17 @@ def main():
     # Шахматы
     application.add_handler(CommandHandler("chess", chess_command))
     application.add_handler(CommandHandler("chess_stop", chess_stop))
+    application.add_handler(CommandHandler("chess_legend", chess_legend_command))
     application.add_handler(CommandHandler("chess_pvp", chess_pvp_command))
     application.add_handler(CommandHandler("move", chess_move_command))
     application.add_handler(CommandHandler("chess_draw", chess_draw_command))
+    application.add_handler(CommandHandler("xo", xo_command))
+    application.add_handler(CommandHandler("durak", durak_command))
+    application.add_handler(CommandHandler("durak_stop", durak_stop))
+    application.add_handler(CommandHandler("durak_group", durak_group_command))
+    application.add_handler(CallbackQueryHandler(dgroup_callback, pattern="^dgrp_"))
+    application.add_handler(CallbackQueryHandler(durak_callback, pattern="^dur_"))
+    application.add_handler(CallbackQueryHandler(xo_callback, pattern="^xo_"))
     application.add_handler(CallbackQueryHandler(chess_pvp_callback, pattern="^chesspvp_"))
 
     application.add_handler(CallbackQueryHandler(anketa_dispute_callback, pattern="^anketa_dispute_"))
