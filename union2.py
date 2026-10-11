@@ -36,6 +36,7 @@ from telegram.ext import (
 from telegram.error import TelegramError, RetryAfter, BadRequest
 import chess  # pip install chess
 import chess_game  # шахматный модуль (chess_game.py лежит рядом с ботом)
+import chess_board_img  # картинка шахматной доски (chess_board_img.py лежит рядом с ботом; нужен Pillow)
 import durak_game  # карточный «Дурак» (durak_game.py лежит рядом с ботом)
 import durak_group  # «Дурак» для группы на 2-4 игрока (durak_group.py лежит рядом с ботом)
 user_animation_lock = {}
@@ -4438,6 +4439,41 @@ def _render_chess_message(game, comment: str, bot_san: Optional[str] = None, foo
     return "\n\n".join(parts)
 
 
+def _chess_caption(comment: str = "", bot_san: Optional[str] = None, footer: Optional[str] = None) -> str:
+    """Подпись под картинкой доски (HTML, без самой доски)."""
+    parts = []
+    if comment:
+        parts.append(_html_escape(comment))
+    if bot_san:
+        parts.append(f"Мой ход: <b>{_html_escape(bot_san)}</b>")
+    if footer:
+        parts.append(_html_escape(footer))
+    return "\n\n".join(parts)
+
+
+async def _send_board_image(bot, chat_id: int, board, orient: bool, caption_html: str,
+                            fallback_html: str, message=None):
+    """Отправляет доску картинкой (PNG) с подписью. Если картинку сделать/отправить не вышло
+    (например, не установлен Pillow) — отправляет прежнюю текстовую доску из fallback_html.
+    Если передан message — отвечает на него, иначе пишет в chat_id."""
+    try:
+        png = await asyncio.to_thread(chess_board_img.render_board_png, board, orient)
+        long_caption = len(caption_html) > 1000  # лимит подписи к фото в Telegram — 1024 символа
+        kwargs = {} if long_caption else {"caption": caption_html or None, "parse_mode": 'HTML'}
+        if message is not None:
+            sent = await message.reply_photo(photo=png, **kwargs)
+        else:
+            sent = await bot.send_photo(chat_id=chat_id, photo=png, **kwargs)
+        if long_caption:
+            await bot.send_message(chat_id=chat_id, text=caption_html, parse_mode='HTML')
+        return sent
+    except Exception as e:
+        logger.warning(f"Не удалось отправить картинку доски, шлю текстом: {e}")
+        if message is not None:
+            return await message.reply_text(fallback_html, parse_mode='HTML')
+        return await bot.send_message(chat_id=chat_id, text=fallback_html, parse_mode='HTML')
+
+
 async def _chess_maybe_sticker(bot, chat_id: int, user_id: int, emotion_key: Optional[str], force: bool = False):
     if not emotion_key:
         return
@@ -4522,10 +4558,13 @@ async def chess_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Ты играешь белыми — начинай." if user_color == chess.WHITE
             else "Ты играешь чёрными — отвечай на мой ход."
         )
-        await update.message.reply_text(
-            _render_chess_message(game, text, bot_san, footer=None) + "\n\n" + CHESS_HOWTO + "\n\n" + _html_escape(footer),
-            parse_mode='HTML'
+        await _send_board_image(
+            context.bot, chat_id, game.board, game.user_color,
+            _chess_caption(text, bot_san, footer),
+            _render_chess_message(game, text, bot_san, footer=footer),
+            message=update.message
         )
+        await update.message.reply_text(CHESS_HOWTO, parse_mode='HTML')
         await _chess_maybe_sticker(context.bot, chat_id, user.id, emotion_key, force=True)
     except Exception as e:
         logger.error(f"Не удалось начать шахматную партию для {user.id}: {e}", exc_info=True)
@@ -4549,9 +4588,10 @@ async def chess_stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if pvp.color_of(user.id) is not None:
             oid, oname = pvp.opponent_of(user.id)
             pvp_games.pop(pvp.chat_id, None)
-            await update.message.reply_text(
-                f"{_mention(user.id, user.full_name)} сдался. Победил(а) {_mention(oid, oname)}.\n\n{_pvp_board_html(pvp)}",
-                parse_mode='HTML'
+            resign_text = f"{_mention(user.id, user.full_name)} сдался. Победил(а) {_mention(oid, oname)}."
+            await _send_board_image(
+                context.bot, update.effective_chat.id, pvp.board, chess.WHITE,
+                resign_text, f"{resign_text}\n\n{_pvp_board_html(pvp)}", message=update.message
             )
         elif is_admin(user.id):
             pvp_games.pop(pvp.chat_id, None)
@@ -4625,8 +4665,10 @@ async def handle_chess_message(update: Update, context: ContextTypes.DEFAULT_TYP
             situation = 'user_won' if kind == 'user_won' else 'draw'
             ai_text, _, emotion_key = await _chess_ai_turn(game, user, situation, user_move_san=user_san)
             chess_games.pop(user.id, None)
-            await msg.reply_text(
-                _render_chess_message(game, ai_text, None, footer=result_line), parse_mode='HTML'
+            await _send_board_image(
+                context.bot, chat_id, game.board, game.user_color,
+                _chess_caption(ai_text, None, result_line),
+                _render_chess_message(game, ai_text, None, footer=result_line), message=msg
             )
             await _chess_maybe_sticker(context.bot, chat_id, user.id, emotion_key, force=True)
             return True
@@ -4643,8 +4685,10 @@ async def handle_chess_message(update: Update, context: ContextTypes.DEFAULT_TYP
         if result:  # партию закончил ход бота
             footer = result[1]
             chess_games.pop(user.id, None)
-        await msg.reply_text(
-            _render_chess_message(game, ai_text, bot_san, footer=footer), parse_mode='HTML'
+        await _send_board_image(
+            context.bot, chat_id, game.board, game.user_color,
+            _chess_caption(ai_text, bot_san, footer),
+            _render_chess_message(game, ai_text, bot_san, footer=footer), message=msg
         )
         await _chess_maybe_sticker(context.bot, chat_id, user.id, emotion_key, force=bool(result))
         return True
@@ -4853,14 +4897,19 @@ async def chess_pvp_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
         )
     except TelegramError:
         pass
+    head = (
+        f"<b>Шахматы</b>\n"
+        f"Белые: {_mention(wid, wname)}\n"
+        f"Чёрные: {_mention(bid, bname)}\n\n"
+        f"Ходит {_mention(wid, wname)}."
+    )
+    await _send_board_image(
+        context.bot, chat_id, game.board, chess.WHITE,
+        head, f"{head}\n\n{_pvp_board_html(game)}"
+    )
     await context.bot.send_message(
         chat_id=chat_id,
         text=(
-            f"<b>Шахматы</b>\n"
-            f"Белые: {_mention(wid, wname)}\n"
-            f"Чёрные: {_mention(bid, bname)}\n\n"
-            f"{_pvp_board_html(game)}\n\n"
-            f"Ходит {_mention(wid, wname)}.\n\n"
             f"{CHESS_INPUT_RULES}\n\n"
             "Ход можно писать обычным сообщением или командой <code>/move e4</code> "
             "(команда работает всегда, даже если бот не видит сообщения). "
@@ -4908,9 +4957,11 @@ async def _pvp_try_move(update: Update, context: ContextTypes.DEFAULT_TYPE, game
         nid, nname = game.player(game.board.turn)
         footer = f"Ходит {_mention(nid, nname)}." + (" Шах!" if game.board.is_check() else "")
 
-    await msg.reply_text(
-        f"{_mention(user.id, user.full_name)}: <b>{_html_escape(san)}</b>\n\n{_pvp_board_html(game)}\n\n{footer}",
-        parse_mode='HTML'
+    move_head = f"{_mention(user.id, user.full_name)}: <b>{_html_escape(san)}</b>"
+    await _send_board_image(
+        context.bot, update.effective_chat.id, game.board, chess.WHITE,
+        f"{move_head}\n\n{footer}",
+        f"{move_head}\n\n{_pvp_board_html(game)}\n\n{footer}", message=msg
     )
     return True
 
@@ -4980,8 +5031,10 @@ async def chess_draw_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await msg.reply_text("Ты уже предложил ничью — жди ответа соперника.")
     else:
         pvp_games.pop(game.chat_id, None)
-        await msg.reply_text(
-            f"Ничья по соглашению игроков.\n\n{_pvp_board_html(game)}", parse_mode='HTML'
+        await _send_board_image(
+            context.bot, update.effective_chat.id, game.board, chess.WHITE,
+            "Ничья по соглашению игроков.",
+            f"Ничья по соглашению игроков.\n\n{_pvp_board_html(game)}", message=msg
         )
 
 
