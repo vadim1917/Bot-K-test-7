@@ -233,35 +233,73 @@ def legal_moves_san(board: chess.Board, limit: int = 40) -> str:
 
 
 # ==================== ОТРИСОВКА ДОСКИ ====================
-CHESS_BOARD_STYLE = "unicode"   # "unicode" — фигуры ♔♞, "ascii" — буквы KQRBNP; пустые клетки в обоих случаях — точки
+# По умолчанию — ASCII: все символы одной ширины, поэтому сетка не разъезжается в Telegram.
+# Шахматные юникод-фигуры (♔♞) шрифты рисуют шире/уже точек и букв, из-за чего клетки «плывут»,
+# так что "unicode" оставлен только как опция и в боте не используется.
+CHESS_BOARD_STYLE = "ascii"
 
-# U+265F (чёрная пешка) в некоторых клиентах рисуется как цветной эмодзи — VS15 (U+FE0E) просит текстовый вид.
 _UNICODE_PIECES = {
     (chess.PAWN, True): "♙", (chess.KNIGHT, True): "♘", (chess.BISHOP, True): "♗",
     (chess.ROOK, True): "♖", (chess.QUEEN, True): "♕", (chess.KING, True): "♔",
-    (chess.PAWN, False): "♟\ufe0e", (chess.KNIGHT, False): "♞", (chess.BISHOP, False): "♝",
+    (chess.PAWN, False): "♟", (chess.KNIGHT, False): "♞", (chess.BISHOP, False): "♝",
     (chess.ROOK, False): "♜", (chess.QUEEN, False): "♛", (chess.KING, False): "♚",
 }
 
 
 def render_board(board: chess.Board, user_color: bool, style: Optional[str] = None) -> str:
+    """Белые фигуры — заглавные буквы (KQRBNP), чёрные — строчные (kqrbnp), пустая клетка — точка."""
     style = style or CHESS_BOARD_STYLE
     ranks = range(7, -1, -1) if user_color == chess.WHITE else range(8)
     files = list(range(8)) if user_color == chess.WHITE else list(range(7, -1, -1))
-    lines = []
+
+    header = "  " + " ".join("abcdefgh"[f] for f in files)
+    lines = [header]
     for r in ranks:
         row = []
         for f in files:
             p = board.piece_at(chess.square(f, r))
             if p is None:
-                row.append("·")
+                row.append(".")
             elif style == "unicode":
                 row.append(_UNICODE_PIECES[(p.piece_type, p.color)])
             else:
                 row.append(p.symbol())
-        lines.append(f"{r + 1}  " + " ".join(row))
-    lines.append("   " + " ".join("abcdefgh"[f] for f in files))
+        lines.append(f"{r + 1} " + " ".join(row) + f" {r + 1}")
+    lines.append(header)
     return "\n".join(lines)
+
+
+# Короткая подсказка, которая прикладывается к КАЖДОМУ сообщению с доской (чтобы не листать чат вверх).
+CHESS_LEGEND_SHORT = (
+    "Белые — ЗАГЛАВНЫЕ, чёрные — строчные, . — пусто\n"
+    "K король · Q ферзь · R ладья · B слон · N конь · P пешка"
+)
+
+# Текст для команды /chess_legend (HTML для Telegram).
+CHESS_LEGEND_HTML = (
+    "<b>Обозначения на доске</b>\n"
+    "<pre>"
+    "  a b c d e f g h\n"
+    "8 r n b q k b n r 8\n"
+    "7 p p p p p p p p 7\n"
+    "6 . . . . . . . . 6\n"
+    "5 . . . . . . . . 5\n"
+    "4 . . . . . . . . 4\n"
+    "3 . . . . . . . . 3\n"
+    "2 P P P P P P P P 2\n"
+    "1 R N B Q K B N R 1\n"
+    "  a b c d e f g h"
+    "</pre>\n"
+    "• <b>Белые</b> — ЗАГЛАВНЫЕ буквы, <b>чёрные</b> — строчные, <code>.</code> — пустая клетка.\n"
+    "• <code>K</code> / <code>k</code> — король (Кр)\n"
+    "• <code>Q</code> / <code>q</code> — ферзь (Ф)\n"
+    "• <code>R</code> / <code>r</code> — ладья (Л)\n"
+    "• <code>B</code> / <code>b</code> — слон (С)\n"
+    "• <code>N</code> / <code>n</code> — конь (К)\n"
+    "• <code>P</code> / <code>p</code> — пешка (в записи хода буква не пишется)\n\n"
+    "Буквы <b>a–h</b> — вертикали (слева направо), цифры <b>1–8</b> — горизонтали. "
+    "Если играешь чёрными, доска перевёрнута: твои фигуры снизу."
+)
 
 
 # ==================== СОСТОЯНИЕ ПАРТИИ ====================
