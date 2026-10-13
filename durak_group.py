@@ -35,6 +35,8 @@ class DurakTable:
         self.names = {host_id: host_name}
         self.message_id: Optional[int] = None   # общее сообщение в группе
         self.dm_ids: dict = {}                  # user_id -> id личного сообщения с рукой
+        self.dm_kinds: dict = {}                # user_id -> "photo" | "text": чем сейчас является личное сообщение
+        self.public_kind: str = "text"          # общее сообщение в группе: лобби — текст, во время партии — фото стола
         self.created = time.time()
         self.last_activity = time.time()
         self.log: list = []
@@ -490,3 +492,110 @@ class DurakTable:
         else:
             lines.extend(self._status_lines())
         return "\n".join(lines)
+    # ---------- картинка стола и подписи (саму картинку рисует durak_img.py) ----------
+    def _role(self, p) -> Optional[str]:
+        if self.state != "play" or p in self.out:
+            return None
+        return "attack" if p == self.attacker else "defend" if p == self.defender else None
+
+    def _short(self, name: str, limit: int = 14) -> str:
+        return name if len(name) <= limit else name[:limit - 1] + "…"
+
+    def _public_short_status(self) -> Optional[str]:
+        if self.stopped_by:
+            return "Партия остановлена"
+        if self.state == "over":
+            return "Ничья" if self.fool is None else f"Дурак — {self._short(self.name(self.fool))}"
+        if self.phase == "attack":
+            return f"Ходит {self._short(self.name(self.attacker))}"
+        if self.phase == "defend":
+            return f"{self._short(self.name(self.defender))} отбивается"
+        if self.phase == "throw":
+            return "Всё отбито — подкидывают или пасуют"
+        if self.phase == "adding":
+            return f"{self._short(self.name(self.defender))} берёт — подкидывают"
+        return None
+
+    def _private_status(self, uid: int):
+        """(строки подсказки в HTML для подписи, короткая надпись для картинки)."""
+        if self.state == "over":
+            return self._result_lines(), self._public_short_status()
+        if uid in self.out:
+            return ["Ты вышел из игры — наблюдай за остальными."], "Ты вышел из игры"
+        cards, _, _ = self.available_actions(uid)
+        if self.phase == "defend" and uid == self.defender:
+            if cards:
+                return ["<b>Твой ход:</b> отбивай картой или бери."], "Отбивайся или бери"
+            return ["<b>Побить нечем — придётся брать.</b>"], "Побить нечем — бери"
+        if self.phase == "attack" and uid == self.attacker:
+            return ["<b>Твоя атака:</b> выбери карту, которой пойдёшь."], "Твоя атака"
+        if self.phase in ("throw", "adding") and uid != self.defender:
+            if uid in self.passed:
+                return ["Ты спасовал. Ждём остальных."], "Ты спасовал"
+            if cards:
+                return (["<b>Можешь подкинуть</b> карту того же достоинства, что на столе, или спасовать."],
+                        "Подкидывай или пасуй")
+            return ["Подкинуть нечего. Ждём остальных."], "Подкинуть нечего"
+        return self._status_lines(), self._public_short_status()
+
+    def img_state(self, uid: Optional[int] = None) -> dict:
+        """Данные для durak_img.render_table_png. uid=None — общая картинка для группы (без руки);
+        uid=игрок — личная: его рука (с подсветкой допустимых карт) и соперники."""
+        private = uid is not None and uid in self.hands
+        opponents = [
+            {"name": self.name(p), "count": len(self.hands.get(p, [])), "out": p in self.out, "role": self._role(p)}
+            for p in self.players if not (private and p == uid)
+        ]
+        playable = None
+        target_idx = None
+        if private and self.state == "play" and uid not in self.out:
+            cards, targets, extras = self.available_actions(uid)
+            if cards or extras:
+                playable = {parse_card_code(code[1:]) for _, code in cards}
+            if targets and self.phase == "defend" and uid == self.defender:
+                target_idx = self._current_target()
+        status = self._private_status(uid)[1] if private else self._public_short_status()
+        return dict(
+            trump=self.trump,
+            trump_card=self.trump_card if self.deck else None,
+            deck_count=len(self.deck),
+            discard_count=self.discard_count,
+            table=[list(p) for p in self.table],
+            hand=self.sort_hand(self.hands[uid]) if private else None,
+            opponents=opponents,
+            playable=playable,
+            target_idx=target_idx,
+            status=status,
+        )
+
+    def _caption(self, head: str, lines: list, tail: list) -> str:
+        e = html.escape
+        log = [e(x) for x in self.log]
+        while True:
+            parts = [head]
+            if log:
+                parts.append("\n".join(log))
+            parts.extend(tail)
+            caption = "\n\n".join(parts)
+            if len(caption) <= 950:
+                return caption
+            if not log:
+                return caption[:950]
+            log = log[-3:] if len(log) > 3 else log[1:]
+
+    def caption_public(self) -> str:
+        """Подпись под общей картинкой в группе."""
+        e = html.escape
+        if self.stopped_by and self.trump is None:
+            return f"<b>Лобби закрыто: {e(self.stopped_by)}.</b>"
+        head = f"<b>Дурак</b> (подкидной) · игроков: {len(self.players)} · козырь <b>{SUIT_SYMBOL[self.trump]}</b>"
+        if self.state == "over":
+            return self._caption(head, [], ["\n".join(self._result_lines()), "Новая партия: /durak_group"])
+        return self._caption(head, [], ["\n".join(self._status_lines()),
+                                        "Свои карты и кнопки хода — в личных сообщениях от бота."])
+
+    def caption_private(self, uid: int) -> str:
+        """Подпись под личной картинкой игрока (рука и кнопки хода — под ней)."""
+        head = f"<b>Дурак</b> (подкидной) — твоя рука · козырь <b>{SUIT_SYMBOL[self.trump]}</b>"
+        lines = self._private_status(uid)[0]
+        return self._caption(head, [], ["\n".join(lines)])
