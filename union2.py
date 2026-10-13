@@ -38,6 +38,7 @@ import chess  # pip install chess
 import chess_game  # шахматный модуль (chess_game.py лежит рядом с ботом)
 import chess_board_img  # картинка шахматной доски (chess_board_img.py лежит рядом с ботом; нужен Pillow)
 import durak_game  # карточный «Дурак» (durak_game.py лежит рядом с ботом)
+import durak_img  # картинка стола «Дурака» (durak_img.py лежит рядом с ботом; нужен Pillow)
 import durak_group  # «Дурак» для группы на 2-4 игрока (durak_group.py лежит рядом с ботом)
 user_animation_lock = {}
 
@@ -5039,9 +5040,16 @@ async def chess_draw_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 
 # ==================== ДУРАК (подкидной, против Амадеуса) ====================
-# Правила и «ум» бота — в durak_game.py. Здесь — только кнопки и обработка нажатий.
+# Правила и «ум» бота — в durak_game.py, картинка стола — в durak_img.py. Как и в шахматах, ходы Амадеус
+# выбирает не нейронка «с нуля»: движок готовит 1-3 варианта, нейронка выбирает один и комментирует партию.
+# Если нейронка недоступна или промолчала — ходит лучший вариант движка.
 # Партия одна на пользователя, хранится в памяти бота и играется только в личке.
 durak_games: dict[int, "durak_game.DurakGame"] = {}
+
+DURAK_STICKER_CHANCE = 0.2   # шанс стикера эмоции после обычного хода (в начале и в конце партии — всегда)
+DURAK_START_FALLBACK = "Подкидной? Хорошо. Раздаю. Не рассчитывай на поблажки."
+DURAK_BUSY_TEXT = "Подожди, я ещё хожу…"
+DURAK_CHAT_FALLBACK = "Не отвлекай — у меня тут партия. Ходи кнопками под столом."
 
 
 def _durak_get(user_id: int):
@@ -5068,6 +5076,115 @@ def _durak_keyboard(game) -> Optional[InlineKeyboardMarkup]:
     return InlineKeyboardMarkup(rows) if rows else None
 
 
+async def _durak_send(bot, chat_id: int, state: dict, caption_html: str, fallback_html: str, markup, message=None):
+    """Отправляет стол картинкой (PNG/JPEG из durak_img) с подписью. Если картинку сделать или отправить
+    не вышло (например, не установлен Pillow) — шлёт текстом fallback_html. Если передан message — отвечает на него.
+    Возвращает (отправленное сообщение, "photo" | "text")."""
+    try:
+        png = await asyncio.to_thread(durak_img.render_table_png, **state)
+        kwargs = dict(photo=png, caption=caption_html, parse_mode='HTML', reply_markup=markup)
+        if message is not None:
+            sent = await message.reply_photo(**kwargs)
+        else:
+            sent = await bot.send_photo(chat_id=chat_id, **kwargs)
+        return sent, "photo"
+    except Exception as e:
+        logger.warning(f"Дурак: не удалось отправить картинку стола, шлю текстом: {e}")
+    if message is not None:
+        sent = await message.reply_text(fallback_html, parse_mode='HTML', reply_markup=markup)
+    else:
+        sent = await bot.send_message(chat_id=chat_id, text=fallback_html, parse_mode='HTML', reply_markup=markup)
+    return sent, "text"
+
+
+async def _durak_edit(bot, chat_id: int, message_id: int, kind: str, state: dict, caption_html: str,
+                      fallback_html: str, markup) -> str:
+    """Обновляет сообщение со столом: фото — новой картинкой, текст — текстом. «Message is not modified»
+    молча игнорируется, остальные TelegramError пробрасываются вызывающему коду."""
+    try:
+        if kind == "photo":
+            try:
+                png = await asyncio.to_thread(durak_img.render_table_png, **state)
+            except Exception as e:
+                logger.warning(f"Дурак: не удалось нарисовать стол, обновляю только подпись: {e}")
+                await bot.edit_message_caption(chat_id=chat_id, message_id=message_id, caption=caption_html,
+                                               parse_mode='HTML', reply_markup=markup)
+                return kind
+            await bot.edit_message_media(
+                chat_id=chat_id, message_id=message_id,
+                media=InputMediaPhoto(media=png, caption=caption_html, parse_mode='HTML'),
+                reply_markup=markup
+            )
+        else:
+            await bot.edit_message_text(chat_id=chat_id, message_id=message_id, text=fallback_html,
+                                        parse_mode='HTML', reply_markup=markup)
+    except BadRequest as e:
+        if "not modified" not in str(e).lower():
+            raise
+    return kind
+
+
+async def _durak_maybe_sticker(bot, chat_id: int, user_id: int, emotion_key: Optional[str], force: bool = False):
+    if not emotion_key:
+        return
+    if force or random.random() < DURAK_STICKER_CHANCE:
+        await send_emotion_sticker(bot, chat_id, emotion_key, None, user_id=user_id)
+
+
+async def _durak_ask_llm(game, user, situation: str, decision: Optional[dict] = None, comment: str = ""):
+    """Один вызов нейронки. Возвращает (реплика, ключ эмоции, номер выбранного варианта | None);
+    при любом сбое — ("", None, None), и тогда ходит лучший вариант движка."""
+    prompt = durak_game.build_prompt(game, situation, decision, comment, user.first_name)
+    system_prompt = SYSTEM_PROMPT + "\n\n" + durak_game.DURAK_SYSTEM_ADDON
+    try:
+        raw = await _run_ai_providers([{"role": "user", "content": prompt}], system_prompt, user.id)
+    except Exception as e:
+        logger.warning(f"Дурак: сбой нейронки у {user.id}: {e}")
+        return "", None, None
+    if raw.startswith(CHESS_LLM_FAIL_PREFIXES):
+        return "", None, None
+    text, emotion_key = parse_emotion_tag(raw)
+    text, move_idx = durak_game.parse_durak_move_tag(text)
+    text, _ = parse_grudge_tag(text)
+    text, _ = parse_trust_tag(text)
+    text, _ = parse_zoom_stage(text)
+    text, _ = parse_rp_mode_tag(text)
+    text, _ = parse_no_reply_tag(text)
+    text = strip_stray_meta_tags(text)
+    return text, emotion_key, move_idx
+
+
+async def _durak_bot_turns(game, user, situation: str):
+    """Амадеус делает все свои ходы до момента, когда нужно действие игрока. Первое решение отдаём нейронке
+    (она выбирает вариант и комментирует), остальные ходы в той же цепочке делает движок — один вызов нейронки
+    на одно действие игрока. Если партия закончилась — отдельная реплика про итог.
+    Возвращает (реплика | "", ключ эмоции | None)."""
+    comment, emotion = "", None
+    game.advance()
+    decision = game.bot_decision()
+    if decision is None and situation == 'start':  # первым ходит игрок — Амадеус просто здоровается
+        comment, emotion, _ = await _durak_ask_llm(game, user, 'start')
+    asked = False
+    while decision:
+        idx = 0
+        if not asked:
+            asked = True
+            comment, emotion, move_idx = await _durak_ask_llm(game, user, situation, decision)
+            if move_idx is not None and 1 <= move_idx <= len(decision["options"]):
+                idx = move_idx - 1
+            # иначе нейронка промолчала или ошиблась — ходит лучший вариант движка
+        game.bot_apply(decision["options"][idx]["act"])
+        game.advance()
+        decision = game.bot_decision()
+
+    if game.phase == "over":
+        sit = {"P": "user_won", "B": "bot_won"}.get(game.result, "draw")
+        text, emo, _ = await _durak_ask_llm(game, user, sit)
+        comment = text or game.end_comment_fallback()
+        emotion = emo or emotion
+    return comment, emotion
+
+
 @rate_limit()
 async def durak_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/durak — подкидной дурак против Амадеуса (только в личке)."""
@@ -5091,15 +5208,36 @@ async def durak_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     finally:
         session.close()
 
+    chat_id = update.effective_chat.id
     game = _durak_get(user.id)
     if game:
+        if game.busy:
+            await msg.reply_text(DURAK_BUSY_TEXT)
+            return
         await msg.reply_text("Партия уже идёт — вот её текущее состояние. Сдаться: /durak_stop.")
-    else:
-        game = durak_game.DurakGame(uuid.uuid4().hex[:8])
-        durak_games[user.id] = game
+        await _durak_send(context.bot, chat_id, game.img_state(), game.render_caption(),
+                          game.render_caption(with_hand=True), _durak_keyboard(game), message=msg)
+        return
+
+    game = durak_game.DurakGame(uuid.uuid4().hex[:8], manual_bot=True)
+    durak_games[user.id] = game
+    game.busy = True
+    try:
+        await context.bot.send_chat_action(chat_id=chat_id, action='typing')
+        comment, emotion_key = await _durak_bot_turns(game, user, 'start')
+        comment = comment or DURAK_START_FALLBACK
+        game.add_dialog("Амадеус", comment)
         if game.phase == "over":  # на всякий случай: партия не должна заканчиваться на раздаче
             durak_games.pop(user.id, None)
-    await msg.reply_text(game.render_text(), parse_mode='HTML', reply_markup=_durak_keyboard(game))
+        await _durak_send(context.bot, chat_id, game.img_state(), game.render_caption(comment),
+                          game.render_caption(comment, with_hand=True), _durak_keyboard(game), message=msg)
+        await _durak_maybe_sticker(context.bot, chat_id, user.id, emotion_key, force=True)
+    except Exception as e:
+        logger.error(f"Не удалось начать партию в дурака для {user.id}: {e}", exc_info=True)
+        durak_games.pop(user.id, None)
+        await msg.reply_text("Что-то пошло не так с картами. Попробуй /durak ещё раз.")
+    finally:
+        game.busy = False
 
 
 @rate_limit()
@@ -5133,45 +5271,111 @@ async def durak_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except TelegramError:
             pass
         return
+    if game.busy:  # Амадеус ещё думает над прошлым ходом
+        await query.answer(DURAK_BUSY_TEXT)
+        return
 
+    game.busy = True
     try:
-        if action == "take":
-            game.user_take()
-        elif action == "bito":
-            game.user_bito()
-        elif action == "done":
-            game.user_done_adding()
-        elif action.startswith("c"):
-            card = durak_game.parse_card_code(action[1:])
-            if game.phase == "defend":
-                game.user_defend(card)
+        try:
+            if action == "take":
+                game.user_take()
+            elif action == "bito":
+                game.user_bito()
+            elif action == "done":
+                game.user_done_adding()
+            elif action.startswith("c"):
+                card = durak_game.parse_card_code(action[1:])
+                if game.phase == "defend":
+                    game.user_defend(card)
+                else:
+                    game.user_attack(card)
+            elif action.startswith("g") and action[1:].isdigit():
+                game.set_target(int(action[1:]))
             else:
-                game.user_attack(card)
-        elif action.startswith("g") and action[1:].isdigit():
-            game.set_target(int(action[1:]))
-        else:
-            await query.answer()
+                await query.answer()
+                return
+        except durak_game.DurakError as e:
+            await query.answer(str(e), show_alert=True)
             return
-    except durak_game.DurakError as e:
-        await query.answer(str(e), show_alert=True)
-        return
-    except Exception as e:
-        logger.error(f"Ошибка в партии дурака у {user.id}: {e}", exc_info=True)
-        durak_games.pop(user.id, None)
-        await query.answer("Что-то сломалось в партии. Начни заново: /durak", show_alert=True)
-        return
+        except Exception as e:
+            logger.error(f"Ошибка в партии дурака у {user.id}: {e}", exc_info=True)
+            durak_games.pop(user.id, None)
+            await query.answer("Что-то сломалось в партии. Начни заново: /durak", show_alert=True)
+            return
 
-    await query.answer()
-    text, markup = game.render_text(), _durak_keyboard(game)
-    if game.phase == "over":
-        durak_games.pop(user.id, None)
+        await query.answer()
+        msg = query.message
+        chat_id = msg.chat_id if msg else user.id
+        try:
+            if game.bot_decision() or game.phase == "over":
+                await context.bot.send_chat_action(chat_id=chat_id, action='typing')
+            comment, emotion_key = await _durak_bot_turns(game, user, 'move')
+        except Exception as e:
+            logger.error(f"Ошибка хода Амадеус в дураке у {user.id}: {e}", exc_info=True)
+            durak_games.pop(user.id, None)
+            try:
+                await context.bot.send_message(chat_id=chat_id, text="Что-то сломалось в партии. Начни заново: /durak")
+            except TelegramError:
+                pass
+            return
+        game.add_dialog("Амадеус", comment)
+        over = game.phase == "over"
+        if over:
+            durak_games.pop(user.id, None)
+        if msg:
+            kind = "photo" if msg.photo else "text"
+            try:
+                await _durak_edit(context.bot, chat_id, msg.message_id, kind, game.img_state(),
+                                  game.render_caption(comment), game.render_caption(comment, with_hand=True),
+                                  _durak_keyboard(game))
+            except TelegramError as e:
+                logger.warning(f"Дурак: не удалось обновить сообщение: {e}")
+        await _durak_maybe_sticker(context.bot, chat_id, user.id, emotion_key, force=over)
+    finally:
+        game.busy = False
+
+
+async def handle_durak_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    """Вызывается из handle_all_text. True — сообщение обработано как реплика посреди партии в дурака:
+    Амадеус отвечает по-человечески и напоминает, что ход за игроком (как в шахматах)."""
+    user = update.effective_user
+    msg = update.message
+    if not user or not msg or not msg.text:
+        return False
+    game = _durak_get(user.id)
+    if not game:
+        return False
+    text = msg.text.strip()
+    if not text:
+        return False
+    if game.busy:
+        return True  # ещё хожу — лишние сообщения игнорируем
+
+    allowed, remaining = check_spam_and_ban(user.id)
+    if not allowed:
+        await msg.reply_text(
+            f"Антиспам: вы превысили лимит сообщений.\n"
+            f"Доступ к боту будет восстановлен через {remaining // 60} мин {remaining % 60} сек."
+        )
+        return True
+
+    chat_id = update.effective_chat.id
+    game.busy = True
+    game.touch()
     try:
-        await query.edit_message_text(text, parse_mode='HTML', reply_markup=markup)
-    except BadRequest as e:
-        if "not modified" not in str(e).lower():
-            logger.warning(f"Дурак: не удалось обновить сообщение: {e}")
-    except TelegramError as e:
-        logger.warning(f"Дурак: не удалось обновить сообщение: {e}")
+        await context.bot.send_chat_action(chat_id=chat_id, action='typing')
+        reply, emotion_key, _ = await _durak_ask_llm(game, user, 'chat', comment=text)
+        reply = reply or DURAK_CHAT_FALLBACK
+        game.add_dialog("Собеседник", text)
+        game.add_dialog("Амадеус", reply)
+        await msg.reply_text(reply)
+        await _durak_maybe_sticker(context.bot, chat_id, user.id, emotion_key)
+    except Exception as e:
+        logger.error(f"Ошибка реплики в партии дурака у {user.id}: {e}", exc_info=True)
+    finally:
+        game.busy = False
+    return True
 
 
 # ==================== ДУРАК В ГРУППЕ (2-4 игрока) ====================
@@ -5256,28 +5460,41 @@ async def _dgroup_send_dm(bot, game, uid: int, text: str, markup) -> bool:
         return False
 
 
+async def _dgroup_send_dm_table(bot, game, uid: int) -> bool:
+    """Присылает игроку в личку картинку стола с его рукой и кнопками хода."""
+    try:
+        sent, kind = await _durak_send(bot, uid, game.img_state(uid), game.caption_private(uid),
+                                       game.render_private(uid), _dgroup_dm_keyboard(game, uid))
+    except TelegramError as e:
+        logger.info(f"Дурак: не удалось написать игроку {uid} в личку: {e}")
+        return False
+    game.dm_ids[uid] = sent.message_id
+    game.dm_kinds[uid] = kind
+    return True
+
+
 async def _dgroup_update_dm(bot, game, uid: int):
-    text = game.render_private(uid)
-    markup = _dgroup_dm_keyboard(game, uid)
     mid = game.dm_ids.get(uid)
     if mid:
         try:
-            await bot.edit_message_text(chat_id=uid, message_id=mid, text=text, parse_mode='HTML', reply_markup=markup)
+            await _durak_edit(bot, uid, mid, game.dm_kinds.get(uid, "text"), game.img_state(uid),
+                              game.caption_private(uid), game.render_private(uid), _dgroup_dm_keyboard(game, uid))
             return
-        except BadRequest as e:
-            if "not modified" in str(e).lower():
-                return
         except TelegramError:
             pass
-    await _dgroup_send_dm(bot, game, uid, text, markup)
+    await _dgroup_send_dm_table(bot, game, uid)
 
 
 async def _dgroup_update_public(bot, game):
     try:
-        await bot.edit_message_text(
-            chat_id=game.chat_id, message_id=game.message_id, text=game.render_public(),
-            parse_mode='HTML', reply_markup=_dgroup_public_keyboard(game)
-        )
+        if game.public_kind == "photo" and game.trump is not None:
+            await _durak_edit(bot, game.chat_id, game.message_id, "photo", game.img_state(None),
+                              game.caption_public(), game.render_public(), _dgroup_public_keyboard(game))
+        else:
+            await bot.edit_message_text(
+                chat_id=game.chat_id, message_id=game.message_id, text=game.render_public(),
+                parse_mode='HTML', reply_markup=_dgroup_public_keyboard(game)
+            )
     except BadRequest as e:
         if "not modified" not in str(e).lower():
             logger.warning(f"Дурак (группа): не удалось обновить сообщение: {e}")
@@ -5287,9 +5504,14 @@ async def _dgroup_update_public(bot, game):
 
 async def _dgroup_refresh(bot, game):
     """Обновляет общее сообщение в группе и личные сообщения всех игроков."""
-    await _dgroup_update_public(bot, game)
-    for uid in game.players:
-        await _dgroup_update_dm(bot, game, uid)
+    results = await asyncio.gather(
+        _dgroup_update_public(bot, game),
+        *(_dgroup_update_dm(bot, game, uid) for uid in game.players),
+        return_exceptions=True,
+    )
+    for r in results:
+        if isinstance(r, Exception):
+            logger.warning(f"Дурак (группа): ошибка при обновлении сообщений: {r}")
     if game.state == "over":
         _dgroup_drop(game)
 
@@ -5437,7 +5659,7 @@ async def _dgroup_lobby_action(update: Update, context: ContextTypes.DEFAULT_TYP
             game.start()
             failed = []
             for uid in game.players:
-                if not await _dgroup_send_dm(bot, game, uid, game.render_private(uid), _dgroup_dm_keyboard(game, uid)):
+                if not await _dgroup_send_dm_table(bot, game, uid):
                     failed.append(game.name(uid))
             if failed:
                 game.state = "over"
@@ -5448,6 +5670,25 @@ async def _dgroup_lobby_action(update: Update, context: ContextTypes.DEFAULT_TYP
                 await query.answer()
                 return
             await query.answer("Партия началась! Карты — у тебя в личке.")
+            # Лобби (текст) остаётся в истории чата, а стол дальше живёт в новом сообщении-картинке.
+            old_mid = game.message_id
+            try:
+                sent, kind = await _durak_send(bot, game.chat_id, game.img_state(None), game.caption_public(),
+                                               game.render_public(), _dgroup_public_keyboard(game))
+            except TelegramError as e:
+                logger.warning(f"Дурак (группа): не удалось отправить стол: {e}")
+                await _dgroup_update_public(bot, game)
+                return
+            game.message_id = sent.message_id
+            game.public_kind = kind
+            try:
+                await bot.edit_message_text(
+                    chat_id=game.chat_id, message_id=old_mid, parse_mode='HTML', reply_markup=None,
+                    text=game.render_lobby() + "\n\n<b>Партия началась — стол в сообщении ниже.</b>"
+                )
+            except TelegramError:
+                pass
+            return
         elif action == "cancel":
             if user.id != game.host_id and not is_admin(user.id):
                 raise durak_group.DurakError("Отменить лобби может организатор или администратор.")
@@ -6049,6 +6290,11 @@ async def handle_all_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Идёт шахматная партия — сообщения в личке трактуются как ходы/реплики по партии.
     if update.effective_chat.type == 'private' and user_id in chess_games:
         if await handle_chess_message(update, context):
+            return
+
+    # Идёт партия в дурака — реплики в личке тоже часть партии: Амадеус отвечает и напоминает про ход.
+    if update.effective_chat.type == 'private' and user_id in durak_games:
+        if await handle_durak_message(update, context):
             return
 
     # В групповых RP-чатах (ALLOWED_CHAT_IDS) нейронка отвечает только если её позвали:
