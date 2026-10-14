@@ -107,6 +107,8 @@ class DurakGame:
         self.events: list = []           # то же самое, но в третьем лице — для нейронки («Собеседник бьёт…»)
         self.dialog = deque(maxlen=6)    # недавние реплики (как в шахматах)
         self.busy = False                # пока Амадеус думает, новые нажатия кнопок игнорируются
+        self.say_mode = False            # True — кнопки карт вставляют ход в поле ввода (чтобы дописать реплику)
+        self.state_msg_id: Optional[int] = None  # сообщение со столом, на котором сейчас висят кнопки
         self.last_activity = time.time()
 
         self.attacker = self._first_attacker()
@@ -671,7 +673,10 @@ def build_prompt(game: DurakGame, situation: str, decision: Optional[dict] = Non
             lines.append("Партия только начинается, первый ход за собеседником. Коротко и в своём характере "
                          "поприветствуй его и предложи начинать. Ход выбирать не нужно.")
     elif situation == 'move':
-        lines.append("Сейчас твой ход в партии. Отреагируй на происходящее и выбери вариант.")
+        line = "Сейчас твой ход в партии. Отреагируй на происходящее и выбери вариант."
+        if comment:
+            line += f" Собеседник приписал к своему ходу реплику: «{comment}» — ответь и на неё."
+        lines.append(line)
     elif situation == 'chat':
         lines.append(f"Собеседник написал не ход, а: «{comment}». Ответь по существу в своём характере, а потом "
                      f"напомни, что ход за ним — кнопки под сообщением со столом. Ход пока не выбирай.")
@@ -688,3 +693,77 @@ def build_prompt(game: DurakGame, situation: str, decision: Optional[dict] = Non
         numbered = "\n".join(f"{i}. {o['label']}" for i, o in enumerate(decision["options"], 1))
         lines.append("Варианты хода (выбери ровно один и укажи его тегом [durak_move: N]):\n" + numbered)
     return "\n\n".join(lines)
+
+
+# ==================== РАЗБОР ХОДА, НАПИСАННОГО ТЕКСТОМ ====================
+# «6♣ держи», «В пик», «10ч», «беру», «бито», «хватит»: ход в начале (или в конце) сообщения, остальное — реплика.
+_SUIT_CHARS = {"♠": "S", "♤": "S", "♥": "H", "♡": "H", "♦": "D", "♢": "D", "♣": "C", "♧": "C",
+               "s": "S", "h": "H", "d": "D", "c": "C", "п": "S", "ч": "H", "б": "D", "к": "C", "т": "C"}
+_RANK_CHARS = {"6": 6, "7": 7, "8": 8, "9": 9, "10": 10, "в": 11, "j": 11, "д": 12, "q": 12,
+               "к": 13, "k": 13, "т": 14, "a": 14}
+_RANK_PAT = r"(10|[6-9]|[вдктjqka])"
+_CARD_RE = re.compile(rf"^{_RANK_PAT}([♠♤♥♡♦♢♣♧shdcпчбкт])$", re.IGNORECASE)
+_RANK_RE = re.compile(rf"^{_RANK_PAT}$", re.IGNORECASE)
+_COMMANDS = {
+    "take": {"беру", "взять", "возьму", "заберу", "take"},
+    "bito": {"бито", "bito"},
+    "done": {"хватит", "done"},
+}
+
+
+def _clean_token(tok: str) -> str:
+    return (tok or "").strip().strip('.,!?;:()"«»\'').lower()
+
+
+def _suit_from_word(word: str) -> Optional[str]:
+    w = _clean_token(word)
+    if w.startswith("пик"):
+        return "S"
+    if w.startswith("чер"):
+        return "H"
+    if w.startswith("буб"):
+        return "D"
+    if w.startswith("треф") or w.startswith("крес"):
+        return "C"
+    return None
+
+
+def _parse_at(parts: list, i: int):
+    """Пробует прочитать ход, начиная с parts[i]. Возвращает (действие | None, сколько слов занял ход)."""
+    tok = _clean_token(parts[i])
+    for action, words in _COMMANDS.items():
+        if tok in words:
+            return action, 1
+    m = _CARD_RE.match(tok)
+    if m:
+        return "c" + card_code((_RANK_CHARS[m.group(1).lower()], _SUIT_CHARS[m.group(2).lower()])), 1
+    if _RANK_RE.match(tok) and i + 1 < len(parts):
+        suit = _suit_from_word(parts[i + 1])
+        if suit is None and len(_clean_token(parts[i + 1])) == 1:
+            suit = _SUIT_CHARS.get(_clean_token(parts[i + 1]))
+        if suit:
+            return "c" + card_code((_RANK_CHARS[tok], suit)), 2
+    return None, 0
+
+
+def parse_move_text(text: str):
+    """(действие | None, реплика). Действие в том же виде, что и в кнопках: «c6C» (карта), take, bito, done."""
+    parts = (text or "").split()
+    if not parts:
+        return None, ""
+    action, n = _parse_at(parts, 0)
+    if action:
+        return action, " ".join(parts[n:]).strip()
+    for k in (2, 1):  # ход в конце сообщения: «ну давай 6♣» или «ну давай В пик»
+        if len(parts) > k:
+            action, n = _parse_at(parts, len(parts) - k)
+            if action and n == k:
+                return action, " ".join(parts[:-k]).strip()
+    return None, (text or "").strip()
+
+
+def action_label(action: str) -> str:
+    """Подпись действия для подсказок («6♣», «беру»)."""
+    if action.startswith("c"):
+        return card_str(parse_card_code(action[1:]))
+    return {"take": "беру", "bito": "бито", "done": "хватит"}.get(action, action)
