@@ -748,7 +748,10 @@ def _parse_at(parts: list, i: int):
 
 def parse_move_text(text: str):
     """(действие | None, реплика). Действие в том же виде, что и в кнопках: «c6C» (карта), take, bito, done."""
-    parts = (text or "").split()
+    # Кнопка «✍️ С репликой» вставляет в поле «@бот 6♣ »; если игрок отправил это обычным сообщением,
+    # а не выбрал вариант из списка, упоминание бота в начале просто отбрасываем.
+    text = re.sub(r"^\s*@\w+\s*", "", text or "")
+    parts = text.split()
     if not parts:
         return None, ""
     action, n = _parse_at(parts, 0)
